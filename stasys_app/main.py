@@ -2816,7 +2816,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.btn_record)
 
         self.lbl_record_state = QLabel("● IDLE")
-        self.lbl_record_state.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px;")
+        self.lbl_record_state.setStyleSheet(
+            f"color: {COLORS['text_muted']}; font-size: 12px; font-weight: 600;")
         self.lbl_record_state.setAlignment(Qt.AlignCenter)
         left_layout.addWidget(self.lbl_record_state)
 
@@ -4753,6 +4754,25 @@ class MainWindow(QMainWindow):
                     {style}
                 }}
             """)
+
+        # Update recording indicator based on detector.is_recording
+        if hasattr(self.detector, 'is_recording') and self.detector.is_recording:
+            # Continuous recording active
+            if state == "POST_GATHER":
+                # Shot just captured
+                self.lbl_record_state.setText("● CAPTURED")
+                self.lbl_record_state.setStyleSheet(
+                    f"color: {COLORS['accent_blue']}; font-size: 12px; font-weight: 600;")
+            else:
+                # Recording ready for next shot
+                self.lbl_record_state.setText("● REC")
+                self.lbl_record_state.setStyleSheet(
+                    f"color: #FF5252; font-size: 12px; font-weight: 600;")
+        else:
+            # Not calibrated / not recording
+            self.lbl_record_state.setText("● IDLE")
+            self.lbl_record_state.setStyleSheet(
+                f"color: {COLORS['text_muted']}; font-size: 12px; font-weight: 600;")
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
