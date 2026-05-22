@@ -119,12 +119,12 @@ ARMED_ROT_LIMIT            = 15.0
 
 PRESHOT_ROUTINE_DURATION_IDX = 800    # 8s at 100Hz
 APPROACH_SETTLE_DURATION_IDX = 800    # 8s at 100Hz
-HOLD_DURATION_IDX = 300               # 3s at 100Hz (was 400 = 4s)
-PRESS_DURATION_IDX = 100              # 1s at 100Hz (unchanged)
-BREAK_DURATION_IDX = 1               # T-0 marker (single sample)
-FOLLOWTHROUGH_DURATION_IDX = 300     # 3s at 100Hz (was 1600 = 16s)
-TRIGGER_INDEX = 2000                 # Fixed trigger position in 40s buffer
-TOTAL_HISTORY_NEEDED = 4000          # 40s circular buffer (was 6710)
+HOLD_DURATION_IDX = 300              # 3s at 100Hz (was 400 = 4s)
+PRESS_DURATION_IDX = 100             # 1s at 100Hz (unchanged)
+BREAK_DURATION_IDX = 1              # T-0 marker (single sample)
+FOLLOWTHROUGH_DURATION_IDX = 300   # 3s at 100Hz (was 1600 = 16s)
+TRIGGER_INDEX = 2000                # Fixed trigger position in 40s buffer
+TOTAL_HISTORY_NEEDED = 4000        # 40s circular buffer (was 6710)
 
 # --- PIEZO RANGE FIX ---
 # Firmware oversamples at 1kHz (10 reads/packet) and picks the PEAK piezo.
