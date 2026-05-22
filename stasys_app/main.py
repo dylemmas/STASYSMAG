@@ -1754,60 +1754,83 @@ class ShotTraceCanvas(QWidget):
         self.phase_boundaries = {}
         self.current_shot_idx = 0    # 1-based shot number for overlay
 
-    # Phase colours
-    COL_HOLD     = '#00D26A'  # Green — stability window
-    COL_PRESS    = '#FFEB3B'  # Yellow — trigger press
-    COL_LOCKTIME = '#FF9800'  # Orange — sear break moment
-    COL_RECOIL   = '#FF5252'  # Red   — recoil + follow-through
-    COL_FT       = '#FF5252'
+    # 6-phase colours (trigger at T-0, T-20s to T+3s = 23s window)
+    COL_PRESHOT_ROUTINE = '#1E88E5'  # Blue   — T-20s to T-12s, dashed
+    COL_APPROACH_SETTLE = '#00BCD4'  # Cyan   — T-12s to T-4s, solid
+    COL_HOLD            = '#00D26A'  # Green  — T-4s to T-1s, solid
+    COL_PRESS           = '#FFEB3B'  # Yellow — T-1s to T-0, solid
+    COL_BREAK           = '#FF9800'  # Orange — T-0 (instant dot)
+    COL_FT              = '#FF5252'  # Red    — T-0 to T+3s, solid
 
-    def set_trace(self, preshot=None, hold=None, press=None, recoil=None,
-                  ft=None, impact_x_cm=0.0, impact_y_cm=0.0):
-        self.preshot_x, self.preshot_y = (preshot if preshot else ([], []))
-        self.hold_x, self.hold_y = (hold if hold else ([], []))
-        self.press_x, self.press_y = (press if press else ([], []))
-        self.recoil_x, self.recoil_y = (recoil if recoil else ([], []))
-        self.ft_x, self.ft_y = (ft if ft else ([], []))
+    def set_trace(self, preshot_routine=None, approach_settle=None, hold=None,
+                  press=None, break_pt=None, ft=None,
+                  impact_x_cm=0.0, impact_y_cm=0.0,
+                  # Backward-compatible 5-phase params (for loading DB traces)
+                  preshot=None, recoil=None):
+        """Load trace data for rendering.
+
+        Accepts either:
+          - 6-phase new format: preshot_routine, approach_settle, hold, press, break_pt, ft
+          - 5-phase old format: preshot, hold, press, recoil, ft (DB backward compat)
+        """
+        # 6-phase new format: preshot_routine + approach_settle are the new keys
+        if preshot_routine is not None or approach_settle is not None:
+            self.psr_x, self.psr_y = (preshot_routine if preshot_routine else ([], []))
+            self.apr_x, self.apr_y = (approach_settle if approach_settle else ([], []))
+            self.hol_x, self.hol_y = (hold if hold else ([], []))
+            self.pre_x, self.pre_y = (press if press else ([], []))
+            self.brk_x, self.brk_y = (break_pt if break_pt else (0.0, 0.0))
+            self.ft_x,  self.ft_y  = (ft if ft else ([], []))
+        # 5-phase old format: preshot, hold, press, recoil, ft (DB compat)
+        elif preshot is not None or hold is not None or recoil is not None:
+            self.psr_x, self.psr_y = (preshot if preshot else ([], []))
+            self.apr_x, self.apr_y = ([], [])  # no approach phase in old format
+            self.hol_x, self.hol_y = (hold if hold else ([], []))
+            self.pre_x, self.pre_y = (press if press else ([], []))
+            # Break is the last point of press
+            self.brk_x = self.pre_x[-1] if self.pre_x else 0.0
+            self.brk_y = self.pre_y[-1] if self.pre_y else 0.0
+            # old "recoil" maps to nothing; FT is follow-through
+            self.ft_x, self.ft_y = (ft if ft else ([], []))
+        else:
+            # No data provided — clear
+            self.psr_x = self.psr_y = []
+            self.apr_x = self.apr_y = []
+            self.hol_x = self.hol_y = []
+            self.pre_x = self.pre_y = []
+            self.brk_x = self.brk_y = 0.0
+            self.ft_x  = self.ft_y  = []
+
         self.impact_x_cm = impact_x_cm
         self.impact_y_cm = impact_y_cm
-
-        # Phase boundary sample indices within the total trace
-        n_preshot = len(self.preshot_x)
-        n_hold    = len(self.hold_x)
-        n_press   = len(self.press_x)
-        n_recoil  = len(self.recoil_x)
-        n_ft      = len(self.ft_x)
-
-        # Lock-time marker (break point) is at preshot + hold + press boundary
-        locktime_idx = n_preshot + n_hold + n_press
-
-        self.phase_boundaries = {
-            'preshot_end':  n_preshot,
-            'hold_end':     n_preshot + n_hold,
-            'press_end':    n_preshot + n_hold + n_press,
-            'locktime_idx': locktime_idx,
-            'recoil_end':   n_preshot + n_hold + n_press + n_recoil,
-            'ft_end':       n_preshot + n_hold + n_press + n_recoil + n_ft,
-        }
-        # Record world coords of break for lock-time dot
-        if n_preshot + n_hold + n_press > 0 and n_press > 0:
-            # break is at last point of press
-            self.break_x = self.press_x[-1] if self.press_x else 0.0
-            self.break_y = self.press_y[-1] if self.press_y else 0.0
         self.playback_pos = 0
+
+        # Build phase_boundaries for timeline scrubber (backward compat)
+        n_psr = len(self.psr_x)
+        n_apr = len(self.apr_x)
+        n_hol = len(self.hol_x)
+        n_pre = len(self.pre_x)
+        n_ft  = len(self.ft_x)
+        self.phase_boundaries = {
+            'preshot_end':  n_psr,
+            'hold_end':     n_psr + n_apr + n_hol,
+            'press_end':    n_psr + n_apr + n_hol + n_pre,
+            'recoil_end':   n_psr + n_apr + n_hol + n_pre,  # no recoil phase
+            'ft_end':       n_psr + n_apr + n_hol + n_pre + n_ft,
+        }
+
         self.update()
 
     def clear_trace(self):
-        self.preshot_x = self.preshot_y = []
-        self.hold_x = self.hold_y = []
-        self.press_x = self.press_y = []
-        self.recoil_x = self.recoil_y = []
-        self.ft_x = self.ft_y = []
-        self.break_x = self.break_y = 0.0
-        self.playback_pos = 0
+        self.psr_x = self.psr_y = []
+        self.apr_x = self.apr_y = []
+        self.hol_x = self.hol_y = []
+        self.pre_x = self.pre_y = []
+        self.brk_x = self.brk_y = 0.0
+        self.ft_x  = self.ft_y  = []
         self.impact_x_cm = 0.0
         self.impact_y_cm = 0.0
-        self.phase_boundaries = {}
+        self.playback_pos = 0
         self.current_shot_idx = 0
         self.update()
 
@@ -1841,46 +1864,58 @@ class ShotTraceCanvas(QWidget):
         cx, cy = w // 2, h // 2
         base_scale = min(w, h) / (2 * self.plot_range) * 0.9 * self.scale
 
-        # ── Playback-relative position (accounting for invisible pre-shot prefix) ─
-        n_preshot = len(self.preshot_x)
-        # Playback position is relative to total trace; subtract n_preshot to get
-        # position within the visible hold/press/recoil/ft portion
-        vis_pos = max(0, self.playback_pos - n_preshot)
+        # Phase sample counts for boundary calculations
+        n_psr = len(self.psr_x)
+        n_apr = len(self.apr_x)
+        n_hol = len(self.hol_x)
+        n_pre = len(self.pre_x)
+        n_ft  = len(self.ft_x)
 
-        # ── Phase 1: Hold (green) — full trace always visible ──────────────────
-        self._draw_path(painter, self.hold_x, self.hold_y,
+        # Playback position relative to post-trigger portion
+        # playback_pos counts samples from trigger (T-0) forward
+        # vis_pos >= 0 means post-trigger phases are visible
+        vis_pos = max(0, self.playback_pos)
+
+        # ── Phase 1: Pre-Shot Routine (blue dashed) — always fully visible ──────
+        psr_pen = QPen(QColor(self.COL_PRESHOT_ROUTINE), 1.5)
+        psr_pen.setStyle(Qt.DashLine)
+        self._draw_path(painter, self.psr_x, self.psr_y,
+                        cx, cy, base_scale, psr_pen)
+
+        # ── Phase 2: Approach & Settle (cyan solid) — always fully visible ───────
+        self._draw_path(painter, self.apr_x, self.apr_y,
+                        cx, cy, base_scale,
+                        QPen(QColor(self.COL_APPROACH_SETTLE), 2))
+
+        # ── Phase 3: Hold (green solid) — always fully visible ──────────────────
+        self._draw_path(painter, self.hol_x, self.hol_y,
                         cx, cy, base_scale,
                         QPen(QColor(self.COL_HOLD), 2))
 
-        # ── Phase 2: Press (yellow) — stepped by playback ──────────────────────
-        if self.press_x:
-            press_draw = min(vis_pos, len(self.press_x))
+        # ── Phase 4: Trigger Press (yellow solid) — stepped by playback ──────────
+        if self.pre_x:
+            press_draw = min(vis_pos, n_pre)
             if press_draw > 0:
                 self._draw_path(painter,
-                                self.press_x[:press_draw], self.press_y[:press_draw],
+                                self.pre_x[:press_draw], self.pre_y[:press_draw],
                                 cx, cy, base_scale,
                                 QPen(QColor(self.COL_PRESS), 3))
 
-        # ── Phase 3: Lock Time (orange dot at break point) ─────────────────────
-        if self.break_x != 0.0 or self.break_y != 0.0:
-            bx = cx + self.break_x * base_scale
-            by = cy - self.break_y * base_scale
-            painter.setBrush(QBrush(QColor(self.COL_LOCKTIME)))
+        # ── Phase 5: Break (orange dot at T-0) — always fully visible ───────────
+        if self.brk_x != 0.0 or self.brk_y != 0.0:
+            bx = cx + self.brk_x * base_scale
+            by = cy - self.brk_y * base_scale
+            painter.setBrush(QBrush(QColor(self.COL_BREAK)))
             painter.setPen(Qt.NoPen)
             painter.drawEllipse(int(bx) - 6, int(by) - 6, 12, 12)
             painter.setBrush(QBrush(QColor('#FFFFFF')))
             painter.drawEllipse(int(bx) - 3, int(by) - 3, 6, 6)
 
-        # ── Phase 4: Recoil + Follow-through (red) ─────────────────────────────
-        # Recoil: always fully visible
-        self._draw_path(painter, self.recoil_x, self.recoil_y,
-                        cx, cy, base_scale,
-                        QPen(QColor(self.COL_RECOIL), 2))
-        # Follow-through: stepped by playback
+        # ── Phase 6: Follow-Through (red solid) — stepped by playback ────────────
         if self.ft_x:
-            ft_draw = min(vis_pos - len(self.press_x) - len(self.recoil_x),
-                          len(self.ft_x))
-            ft_draw = max(0, ft_draw)
+            # vis_pos counts from T-0 forward; subtract n_pre to get FT position
+            ft_start = n_pre  # follow-through starts after press phase
+            ft_draw = min(max(0, vis_pos - ft_start), n_ft)
             if ft_draw > 0:
                 self._draw_path(painter,
                                 self.ft_x[:ft_draw], self.ft_y[:ft_draw],
@@ -3814,12 +3849,13 @@ class MainWindow(QMainWindow):
         if not s or not s.get('aim_trace'):
             return
         trace = s['aim_trace']
-        preshot = (trace.get('preshot', {}).get('x', []), trace.get('preshot', {}).get('y', []))
-        hold = (trace.get('hold', {}).get('x', []), trace.get('hold', {}).get('y', []))
-        press = (trace.get('press', {}).get('x', []), trace.get('press', {}).get('y', []))
-        recoil = (trace.get('recoil', {}).get('x', []), trace.get('recoil', {}).get('y', []))
-        ft = (trace.get('followthrough', {}).get('x', []), trace.get('followthrough', {}).get('y', []))
-        self.trace_canvas.set_trace(preshot=preshot, hold=hold, press=press, recoil=recoil, ft=ft,
+        self.trace_canvas.set_trace(
+            preshot_routine=trace.get('preshot_routine') or trace.get('preshot'),
+            approach_settle=trace.get('approach_settle'),
+            hold=trace.get('hold'),
+            press=trace.get('press'),
+            break_pt=trace.get('break'),
+            ft=trace.get('followthrough'),
             impact_x_cm=s.get('impact_x_cm', 0.0), impact_y_cm=s.get('impact_y_cm', 0.0))
         self.tabs.setCurrentIndex(1)
 
@@ -4290,12 +4326,13 @@ class MainWindow(QMainWindow):
                 self._playback_timer.stop()
                 self._playback_controls.set_playing(False)
 
-            # Load trace into canvas
+            # Load trace into canvas (6-phase format, with fallback for old DB format)
             self.trace_canvas.set_trace(
-                preshot=shot.get('preshot'),
+                preshot_routine=shot.get('preshot_routine') or shot.get('preshot'),
+                approach_settle=shot.get('approach_settle'),
                 hold=shot.get('hold'),
                 press=shot.get('press'),
-                recoil=shot.get('recoil'),
+                break_pt=shot.get('break'),
                 ft=shot.get('followthrough'),
                 impact_x_cm=shot.get('impact_x_cm', 0.0),
                 impact_y_cm=shot.get('impact_y_cm', 0.0))
@@ -4471,12 +4508,13 @@ class MainWindow(QMainWindow):
         if not s or not s.get('aim_trace'):
             return
         trace = s['aim_trace']
-        preshot = (trace.get('preshot', {}).get('x', []), trace.get('preshot', {}).get('y', []))
-        hold = (trace.get('hold', {}).get('x', []), trace.get('hold', {}).get('y', []))
-        press = (trace.get('press', {}).get('x', []), trace.get('press', {}).get('y', []))
-        recoil = (trace.get('recoil', {}).get('x', []), trace.get('recoil', {}).get('y', []))
-        ft = (trace.get('followthrough', {}).get('x', []), trace.get('followthrough', {}).get('y', []))
-        self.trace_canvas.set_trace(preshot=preshot, hold=hold, press=press, recoil=recoil, ft=ft,
+        self.trace_canvas.set_trace(
+            preshot_routine=trace.get('preshot_routine') or trace.get('preshot'),
+            approach_settle=trace.get('approach_settle'),
+            hold=trace.get('hold'),
+            press=trace.get('press'),
+            break_pt=trace.get('break'),
+            ft=trace.get('followthrough'),
             impact_x_cm=s.get('impact_x_cm', 0.0), impact_y_cm=s.get('impact_y_cm', 0.0))
         self.tabs.setCurrentIndex(1)
 
@@ -4816,10 +4854,11 @@ class MainWindow(QMainWindow):
 
                 # Update trace canvas immediately
                 self.trace_canvas.set_trace(
-                    preshot=shot_res.get('preshot'),
+                    preshot_routine=shot_res.get('preshot_routine'),
+                    approach_settle=shot_res.get('approach_settle'),
                     hold=shot_res['hold'],
-                    press=shot_res['press'],
-                    recoil=shot_res['recoil'],
+                    press=shot_res.get('press'),
+                    break_pt=shot_res.get('break'),
                     ft=shot_res.get('followthrough'),
                     impact_x_cm=shot_res.get('impact_x_cm', 0.0),
                     impact_y_cm=shot_res.get('impact_y_cm', 0.0))
