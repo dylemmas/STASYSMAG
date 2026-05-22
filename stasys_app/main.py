@@ -850,6 +850,12 @@ class ShotDetector:
         # Index of the sample AT the moment the shot triggered (ARMED→POST_GATHER)
         self.trigger_break_idx  = -1
 
+        # Continuous recording buffer state
+        self.is_recording = True   # Always recording when calibrated
+        self.frozen_trace_x = None  # Snapshot on trigger
+        self.frozen_trace_y = None  # Snapshot on trigger
+        self.frozen_trigger_idx = -1  # Index of trigger break in frozen buffer
+
         # Trace buffer: hold + press + recoil + follow-through
         self.trace_x  = deque([0.0] * TOTAL_HISTORY_NEEDED, maxlen=TOTAL_HISTORY_NEEDED)
         self.trace_y  = deque([0.0] * TOTAL_HISTORY_NEEDED, maxlen=TOTAL_HISTORY_NEEDED)
@@ -927,6 +933,16 @@ class ShotDetector:
         self.curr_y = 0.0
         self.trace_x = deque([0.0] * TOTAL_HISTORY_NEEDED, maxlen=TOTAL_HISTORY_NEEDED)
         self.trace_y = deque([0.0] * TOTAL_HISTORY_NEEDED, maxlen=TOTAL_HISTORY_NEEDED)
+        self.is_recording = True
+
+    def freeze_buffer(self):
+        """Called when trigger fires — copies current circular buffer for phase extraction.
+        The buffer always holds the last 40s (4000 samples at 100Hz).
+        Trigger break is always at index TRIGGER_INDEX (2000) in the frozen copy."""
+        self.is_recording = False
+        self.frozen_trace_x = list(self.trace_x)
+        self.frozen_trace_y = list(self.trace_y)
+        self.frozen_trigger_idx = TRIGGER_INDEX  # Always 2000 in the 40s buffer
 
     def _is_stationary(self) -> bool:
         """Gun is at rest when gyro magnitude is near bias-corrected noise floor."""
@@ -1021,6 +1037,7 @@ class ShotDetector:
             self.state_timer -= DT
             if self.state_timer <= 0:
                 self.state = "IDLE"
+                self.is_recording = True  # Resume continuous recording
 
         elif self.state == "IDLE":
             if rot_mag < STABILITY_GYRO_LIMIT:
@@ -1390,8 +1407,9 @@ class ShotDetector:
             shot_result['piezo'] = piezo  # ensure correct piezo in cached result
         self.pending_shot_result = shot_result
         self.shot_result_returned = False
+        self.freeze_buffer()  # Capture 40s circular buffer for phase extraction
         self.state              = "POST_GATHER"
-        self.gather_counter     = RECOIL_DURATION_IDX + FOLLOWTHROUGH_DURATION_IDX
+        self.gather_counter     = FOLLOWTHROUGH_DURATION_IDX  # 3s of post-shot follow-through
         self.armed_sample_count    = 0
         self.piezo_sustained_count = 0
         self.jerk_sustained_count  = 0
