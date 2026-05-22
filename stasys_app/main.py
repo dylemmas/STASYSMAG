@@ -174,10 +174,10 @@ DEFAULT_TRAINING_MODE     = 'Dry Fire'
 #   FT:       recovery toward aim center
 # Lock Time is NOT scored — mechanical latency, not technique-dependent.
 
-WEIGHT_STABILITY_PRESHOT  = 0.10
+WEIGHT_STABILITY_PRESHOT   = 0.10
+WEIGHT_STABILITY_APPROACH  = 0.20
 WEIGHT_STABILITY_HOLD      = 0.25
 WEIGHT_STABILITY_PRESS     = 0.30
-WEIGHT_STABILITY_RECOIL    = 0.20
 WEIGHT_STABILITY_FT        = 0.15
 
 # Zone-based scoring (CEP model): score = 100 * exp(-deviation / ZONE_SCALE)
@@ -1141,42 +1141,63 @@ class ShotDetector:
 
     # ── Shot analysis ────────────────────────────────────────────────────────
 
-    def _phase_indices(self):
-        """Return dict of phase boundary sample indices.
-        All relative to the full trace list where index -1 == newest sample.
+    def _extract_shot_phases(self):
+        """Extract 6-phase shot data from frozen circular buffer.
 
-        Phases (competitive shot breakdown):
-          Pre-Shot    — up to PRESHOOT_DURATION_IDX samples before hold start (NPA setup)
-          Hold        — HOLD_DURATION_IDX samples before press start (stability window)
-          Press       — PRESS_DURATION_IDX samples up to trigger break (trigger squeeze)
-          Lock Time   — mechanical latency at break_idx (single sample marker)
-          Recoil      — RECOIL_DURATION_IDX samples after trigger break (actual recoil)
-          Follow-through — FOLLOWTHROUGH_DURATION_IDX samples after recoil (recovery to aim)
+        Returns dict with phase names as keys, (x_list, y_list) tuples as values.
+        Returns None if frozen buffer is invalid or too short.
+
+        Phases extracted from 40s frozen buffer (trigger at index 2000):
+          - preshot_routine: [0:800] (T-20s to T-12s)
+          - approach_settle: [800:1600] (T-12s to T-4s)
+          - hold: [1600:1900] (T-4s to T-1s)
+          - press: [1900:2000] (T-1s to T-0)
+          - break: [2000] (T-0, single point)
+          - followthrough: [2000:2300] (T-0 to T+3s)
         """
-        n = len(self.trace_x)
-        break_idx = self.trigger_break_idx
-        if break_idx < 0:
+        # Verify frozen buffer exists
+        if self.frozen_trace_x is None or self.frozen_trace_y is None:
             return None
 
-        total_needed = (PRESHOOT_DURATION_IDX + HOLD_DURATION_IDX + PRESS_DURATION_IDX
-                        + RECOIL_DURATION_IDX + FOLLOWTHROUGH_DURATION_IDX)
-        if n < total_needed:
+        # Verify buffer has enough samples for full 23s window
+        min_samples = TRIGGER_INDEX + FOLLOWTHROUGH_DURATION_IDX  # 2000 + 300 = 2300
+        if len(self.frozen_trace_x) < min_samples or len(self.frozen_trace_y) < min_samples:
             return None
 
-        press_start = max(0, break_idx - PRESS_DURATION_IDX)
-        hold_start  = max(0, press_start - HOLD_DURATION_IDX)
-        preshot_start = max(0, hold_start - PRESHOOT_DURATION_IDX)
-        recoil_end  = min(n, break_idx + RECOIL_DURATION_IDX)
-        ft_end      = min(n, break_idx + RECOIL_DURATION_IDX + FOLLOWTHROUGH_DURATION_IDX)
+        # Extract phases using fixed indices relative to trigger at index 2000
+        preshot_routine_x = self.frozen_trace_x[0:PRESHOT_ROUTINE_DURATION_IDX]
+        preshot_routine_y = self.frozen_trace_y[0:PRESHOT_ROUTINE_DURATION_IDX]
+
+        approach_start = PRESHOT_ROUTINE_DURATION_IDX
+        approach_end = approach_start + APPROACH_SETTLE_DURATION_IDX
+        approach_settle_x = self.frozen_trace_x[approach_start:approach_end]
+        approach_settle_y = self.frozen_trace_y[approach_start:approach_end]
+
+        hold_start = approach_end
+        hold_end = hold_start + HOLD_DURATION_IDX
+        hold_x = self.frozen_trace_x[hold_start:hold_end]
+        hold_y = self.frozen_trace_y[hold_start:hold_end]
+
+        press_start = hold_end
+        press_end = TRIGGER_INDEX
+        press_x = self.frozen_trace_x[press_start:press_end]
+        press_y = self.frozen_trace_y[press_start:press_end]
+
+        break_x = self.frozen_trace_x[TRIGGER_INDEX]
+        break_y = self.frozen_trace_y[TRIGGER_INDEX]
+
+        followthrough_start = TRIGGER_INDEX
+        followthrough_end = followthrough_start + FOLLOWTHROUGH_DURATION_IDX
+        followthrough_x = self.frozen_trace_x[followthrough_start:followthrough_end]
+        followthrough_y = self.frozen_trace_y[followthrough_start:followthrough_end]
 
         return {
-            'preshot_start': preshot_start,
-            'hold_start':    hold_start,
-            'press_start':   press_start,
-            'break_idx':     break_idx,
-            'locktime_idx':  break_idx,
-            'recoil_end':    recoil_end,
-            'ft_end':        ft_end,
+            'preshot_routine': (preshot_routine_x, preshot_routine_y),
+            'approach_settle': (approach_settle_x, approach_settle_y),
+            'hold': (hold_x, hold_y),
+            'press': (press_x, press_y),
+            'break': (break_x, break_y),
+            'followthrough': (followthrough_x, followthrough_y),
         }
 
     def _mean(self, vals):
@@ -1400,14 +1421,14 @@ class ShotDetector:
         logger.info("SHOT TRIGGERED — Piezo: %d", piezo)
         self.last_trigger_piezo = piezo
         self.last_trigger_piezo_for_result = piezo
-        self.trigger_break_idx  = len(self.trace_x) - 1
-        # Analyze shot right away — no 20s delay
+        self.trigger_break_idx = len(self.trace_x) - 1
+        self.freeze_buffer()  # Capture 40s circular buffer for phase extraction
+        # Analyze shot after buffer is frozen
         shot_result = self.analyze_shot()
         if shot_result:
             shot_result['piezo'] = piezo  # ensure correct piezo in cached result
         self.pending_shot_result = shot_result
         self.shot_result_returned = False
-        self.freeze_buffer()  # Capture 40s circular buffer for phase extraction
         self.state              = "POST_GATHER"
         self.gather_counter     = FOLLOWTHROUGH_DURATION_IDX  # 3s of post-shot follow-through
         self.armed_sample_count    = 0
@@ -1417,110 +1438,109 @@ class ShotDetector:
         self.trigger_confirm_count = 0
 
     def analyze_shot(self):
-        """MantisX-level 4-phase shot analysis.
+        """6-phase shot analysis using frozen circular buffer.
 
-        Phases relative to trigger-break point:
-          Hold          — up to HOLD_DURATION_IDX samples before press start
-          Press         — PRESS_DURATION_IDX samples up to trigger break
-          Recoil        — RECOIL_DURATION_IDX samples after trigger break
-          Follow-through— FOLLOWTHROUGH_DURATION_IDX samples after recoil
+        Phases extracted from 40s frozen buffer (trigger at index 2000):
+          Pre-Shot Routine  — T-20s to T-12s (8s, 800 samples) blue dashed
+          Approach & Settle — T-12s to T-4s (8s, 800 samples) cyan solid
+          Hold             — T-4s to T-1s (3s, 300 samples) green solid
+          Trigger Press    — T-1s to T-0 (1s, 100 samples) yellow solid
+          Break            — T-0 (instant, 1 sample) orange dot
+          Follow-Through   — T-0 to T+3s (3s, 300 samples) red solid
 
         Returns dict with:
-          score, grade, a2c_angle, a2c_mag,
-          hold_score, press_score, recoil_score, ft_score,
-          hold_stability, recoil_recovery_samples,
-          error_type,
-          hold/press/recoil/followthrough traces (each: (x, y) normalized to hold centroid)
+          6-phase scores (preshot_routine, approach_settle, hold, press, followthrough),
+          A2C metrics, bullet impact prediction, error classification,
+          per-phase traces normalized to hold centroid.
         """
-        indices = self._phase_indices()
-        if indices is None:
+        phases = self._extract_shot_phases()
+        if phases is None:
             return None
 
-        preshot_start = indices['preshot_start']
-        hold_start    = indices['hold_start']
-        press_start   = indices['press_start']
-        break_idx     = indices['break_idx']
-        recoil_end    = indices['recoil_end']
-        ft_end        = indices['ft_end']
+        # Extract phases from frozen buffer
+        psr_x, psr_y = phases['preshot_routine']
+        apr_x, apr_y = phases['approach_settle']
+        hol_x, hol_y = phases['hold']
+        pre_x, pre_y = phases['press']
+        brk_x, brk_y = phases['break']
+        ft_x,  ft_y  = phases['followthrough']
 
-        full_x = list(self.trace_x)
-        full_y = list(self.trace_y)
+        if not hol_x:
+            return None
 
         # Flip traces if mount direction is backward
         if self.mount_direction == "backward":
-            full_x = [x * -1.0 for x in full_x]
-            full_y = [y * -1.0 for y in full_y]
+            psr_x = [x * -1.0 for x in psr_x]
+            psr_y = [y * -1.0 for y in psr_y]
+            apr_x = [x * -1.0 for x in apr_x]
+            apr_y = [y * -1.0 for y in apr_y]
+            hol_x = [x * -1.0 for x in hol_x]
+            hol_y = [y * -1.0 for y in hol_y]
+            pre_x = [x * -1.0 for x in pre_x]
+            pre_y = [y * -1.0 for y in pre_y]
+            ft_x  = [x * -1.0 for x in ft_x]
+            ft_y  = [y * -1.0 for y in ft_y]
+            brk_x = brk_x * -1.0
+            brk_y = brk_y * -1.0
 
-        # Normalize all phases to hold centroid (MantisX-style A2C reference)
-        hold_x = full_x[hold_start:press_start]
-        hold_y = full_y[hold_start:press_start]
-        if not hold_x:
-            return None
+        # Hold centroid as A2C reference (MantisX-style)
+        hold_cx = self._mean(hol_x)
+        hold_cy = self._mean(hol_y)
 
-        hold_cx = self._mean(hold_x)
-        hold_cy = self._mean(hold_y)
-
-        # Pre-Shot trace (preparation / NPA setup — dashed blue)
-        preshot_x = full_x[preshot_start:hold_start]
-        preshot_y = full_y[preshot_start:hold_start]
-
-        # Normalized traces (relative to hold centroid — gives A2C)
-        norm_hold_x  = [x - hold_cx for x in hold_x]
-        norm_hold_y  = [y - hold_cy for y in hold_y]
-        norm_preshot_x = [x - hold_cx for x in preshot_x]
-        norm_preshot_y = [y - hold_cy for y in preshot_y]
-
-        press_x  = full_x[press_start:break_idx + 1]
-        press_y  = full_y[press_start:break_idx + 1]
-        norm_press_x = [x - hold_cx for x in press_x]
-        norm_press_y = [y - hold_cy for y in press_y]
-
-        recoil_x  = full_x[break_idx:recoil_end]
-        recoil_y  = full_y[break_idx:recoil_end]
-        norm_recoil_x = [x - hold_cx for x in recoil_x]
-        norm_recoil_y = [y - hold_cy for y in recoil_y]
-
-        ft_x  = full_x[recoil_end:ft_end]
-        ft_y  = full_y[recoil_end:ft_end]
-        norm_ft_x = [x - hold_cx for x in ft_x]
-        norm_ft_y = [y - hold_cy for y in ft_y]
+        # Normalized traces (relative to hold centroid)
+        norm_psr_x = [x - hold_cx for x in psr_x]
+        norm_psr_y = [y - hold_cy for y in psr_y]
+        norm_apr_x = [x - hold_cx for x in apr_x]
+        norm_apr_y = [y - hold_cy for y in apr_y]
+        norm_hol_x = [x - hold_cx for x in hol_x]
+        norm_hol_y = [y - hold_cy for y in hol_y]
+        norm_pre_x = [x - hold_cx for x in pre_x]
+        norm_pre_y = [y - hold_cy for y in pre_y]
+        norm_ft_x  = [x - hold_cx for x in ft_x]
+        norm_ft_y  = [y - hold_cy for y in ft_y]
+        norm_brk_x = brk_x - hold_cx
+        norm_brk_y = brk_y - hold_cy
 
         # A2C: vector from hold centroid to trigger-break point
-        break_x = full_x[break_idx]
-        break_y = full_y[break_idx]
-        a2c_x = break_x - hold_cx
-        a2c_y = break_y - hold_cy
+        a2c_x = norm_brk_x
+        a2c_y = norm_brk_y
         a2c_mag = math.sqrt(a2c_x ** 2 + a2c_y ** 2)
-        a2c_angle = math.atan2(a2c_x, -a2c_y)   # azimuth from vertical
+        a2c_angle = math.atan2(a2c_x, -a2c_y)  # azimuth from vertical
 
-        # ── Stability Score (MantisX-style) ────────────────────────────────────
-        # Pre-Shot: score preparation phase (NPA setup, breathing rhythm)
-        preshot_score = 0.0
-        if norm_preshot_x:
-            preshot_score, _, _ = self._score_phase(
-                norm_preshot_x, norm_preshot_y, ZONE_SCALE_STABILITY_PRESS * 2.5)
-        hold_score, hold_std_x, hold_std_y = self._score_hold(norm_hold_x, norm_hold_y)
+        # ── Phase Scores ───────────────────────────────────────────────────────
+        # Pre-Shot Routine: score preparation stability (NPA establishment)
+        psr_score = 0.0
+        if norm_psr_x:
+            psr_score, _, _ = self._score_phase(
+                norm_psr_x, norm_psr_y, ZONE_SCALE_STABILITY_PRESS * 2.5)
+
+        # Approach & Settle: score convergence toward aim center
+        apr_score = 0.0
+        if norm_apr_x:
+            apr_score, _, _ = self._score_phase(
+                norm_apr_x, norm_apr_y, ZONE_SCALE_STABILITY_PRESS * 2.0)
+
+        # Hold: score aim stability (tightest phase)
+        hold_score, hold_std_x, hold_std_y = self._score_hold(norm_hol_x, norm_hol_y)
+
+        # Trigger Press: score minimal disturbance during press
         press_score, _, _ = self._score_phase(
-            norm_press_x, norm_press_y, ZONE_SCALE_STABILITY_PRESS)
+            norm_pre_x, norm_pre_y, ZONE_SCALE_STABILITY_PRESS)
 
-        # Recoil: peak displacement from hold centroid
-        recoil_devs = [math.sqrt((x - hold_cx) ** 2 + (y - hold_cy) ** 2)
-                       for x, y in zip(recoil_x, recoil_y)] if recoil_x else []
-        recoil_score = self._zone_score(
-            max(recoil_devs) if recoil_devs else 0,
-            ZONE_SCALE_STABILITY_RECOIL)
+        # Break & Lock Time: instantaneous, scored as part of A2C accuracy
+        # No separate score — included in overall shot quality
 
-        # FT score using stability zone scale
+        # Follow-Through: score recovery / maintained stability post-shot
         ft_score, recovery_samples, ft_mean_dev = self._score_followthrough(norm_ft_x, norm_ft_y)
 
-        # MantisX-style composite stability score (lock time not scored)
-        stability_score = (preshot_score * WEIGHT_STABILITY_PRESHOT
+        # Composite stability score (Break is instantaneous, not scored separately)
+        stability_score = (psr_score * WEIGHT_STABILITY_PRESHOT
+                          + apr_score * WEIGHT_STABILITY_APPROACH
                           + hold_score * WEIGHT_STABILITY_HOLD
                           + press_score * WEIGHT_STABILITY_PRESS
-                          + recoil_score * WEIGHT_STABILITY_RECOIL
                           + ft_score * WEIGHT_STABILITY_FT)
 
-        # ── Shooting Score (SCATT-style) ────────────────────────────────────────
+        # ── Shooting Score (SCATT-style) ──────────────────────────────────────
         group_cx = getattr(self, '_group_center_x', 0.0)
         group_cy = getattr(self, '_group_center_y', 0.0)
         dist_from_group_rad = math.sqrt(
@@ -1529,33 +1549,29 @@ class ShotDetector:
 
         # Directional error classification
         error_type = self._classify_error(
-            hold_x, hold_y, press_x, press_y,
-            ft_x, ft_y, break_x, break_y, hold_cx, hold_cy)
+            hol_x, hol_y, pre_x, pre_y,
+            ft_x, ft_y, brk_x, brk_y, hold_cx, hold_cy)
         error_severity = self._error_severity(a2c_mag)
         coaching = self._coaching_message(error_type, error_severity)
 
         # ── Bullet Impact Prediction ──────────────────────────────────────────
-        # Convert angular A2C deviation to linear displacement at target distance.
-        # a2c_angle from analyze_shot is computed as atan2(a2c_x, -a2c_y),
-        # so we have azimuth = a2c_angle, elevation ≈ break_y - hold_cy.
-        # Linear impact (cm) at distance D: impact = D * tan(angular_dev)
-        # We store target_distance on the detector; default 10m.
         target_d = getattr(self, 'target_distance', DEFAULT_TARGET_DISTANCE)
-        # Horizontal impact: uses azimuth from a2c_x direction
         impact_x_cm = target_d * 100.0 * math.tan(a2c_x)  # cm
-        # Vertical impact: uses elevation from a2c_y direction
         impact_y_cm = target_d * 100.0 * math.tan(a2c_y)  # cm
-        # Impact confidence radius: proportional to hold stability (tight hold = confident)
-        impact_conf_radius = math.sqrt(hold_std_x**2 + hold_std_y**2) * target_d * 100.0 * 1.5  # cm
+        impact_conf_radius = (math.sqrt(hold_std_x**2 + hold_std_y**2)
+                              * target_d * 100.0 * 1.5)  # cm
 
         return {
-            # Stability score (MantisX-style, 0–100)
+            # 6-phase stability scores (0–100)
             "stability_score": round(stability_score, 1),
             "stability_grade": self._stability_letter_grade(stability_score),
-            "preshot_score": round(preshot_score, 1),
+            "preshot_routine_score": round(psr_score, 1),
+            "approach_settle_score": round(apr_score, 1),
             "hold_score": round(hold_score, 1),
             "press_score": round(press_score, 1),
-            "recoil_score": round(recoil_score, 1),
+            "followthrough_score": round(ft_score, 1),
+            # Backward-compatible aliases for existing UI
+            "preshot_score": round(psr_score, 1),
             "ft_score": round(ft_score, 1),
             "hold_stability": round(math.sqrt(hold_std_x ** 2 + hold_std_y ** 2), 5),
             "recoil_recovery_samples": recovery_samples,
@@ -1579,15 +1595,19 @@ class ShotDetector:
             "impact_conf_radius_cm": round(impact_conf_radius, 2),
             "target_distance": round(target_d, 1),
 
-            # Traces
-            "preshot": (norm_preshot_x, norm_preshot_y),
-            "hold": (norm_hold_x, norm_hold_y),
-            "press": (norm_press_x, norm_press_y),
-            "recoil": (norm_recoil_x, norm_recoil_y),
+            # 6-phase traces (normalized to hold centroid)
+            "preshot_routine": (norm_psr_x, norm_psr_y),
+            "approach_settle": (norm_apr_x, norm_apr_y),
+            "hold": (norm_hol_x, norm_hol_y),
+            "press": (norm_pre_x, norm_pre_y),
+            "break": (norm_brk_x, norm_brk_y),
             "followthrough": (norm_ft_x, norm_ft_y),
-            "hold_raw": (hold_x, hold_y),
-            "press_raw": (press_x, press_y),
-            "recoil_raw": (recoil_x, recoil_y),
+            # Backward-compatible aliases
+            "preshot": (norm_psr_x, norm_psr_y),
+            "norm_hold": (norm_hol_x, norm_hol_y),
+            "norm_press": (norm_pre_x, norm_pre_y),
+            "hold_raw": (hol_x, hol_y),
+            "press_raw": (pre_x, pre_y),
             "ft_raw": (ft_x, ft_y),
             "piezo": self.last_trigger_piezo,
         }
