@@ -146,6 +146,7 @@ RING_RADII  = [0.01, 0.02, 0.03]
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE    = os.path.join(SCRIPT_DIR, 'shooter_data.db')
+SETTINGS_FILE = os.path.join(SCRIPT_DIR, 'settings.json')
 
 GRAVITY_NOMINAL   = 9.81
 GRAVITY_TOLERANCE = 1.0
@@ -704,6 +705,34 @@ def log_shot_db(session_id, score, cant, mode):
             'INSERT INTO shots(timestamp,session_id,score,cant,mode) VALUES(?,?,?,?,?)',
             (datetime.now(), session_id, score, cant, mode))
         conn.commit()
+
+
+# ── Settings Persistence ─────────────────────────────────────────────────────
+
+def save_settings(settings_dict):
+    """Save application settings to settings.json."""
+    try:
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump(settings_dict, f, indent=4)
+        logger.debug("Settings saved to %s", SETTINGS_FILE)
+    except Exception as e:
+        logger.error("Failed to save settings: %s", e)
+
+
+def load_settings():
+    """Load application settings from settings.json. Returns empty dict if file doesn't exist."""
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, 'r') as f:
+                settings = json.load(f)
+            logger.debug("Settings loaded from %s", SETTINGS_FILE)
+            return settings
+        else:
+            logger.debug("Settings file not found, using defaults")
+            return {}
+    except Exception as e:
+        logger.error("Failed to load settings: %s", e)
+        return {}
 
 
 # ================= PACKET PARSING =================
@@ -1964,6 +1993,9 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_loop)
         self.timer.start(10)
 
+        # Load saved settings
+        self._load_settings()
+
     def _stylized_button(self, btn, bg, fg='#FFF', border=None):
         style = f"""
             QPushButton {{
@@ -2690,6 +2722,11 @@ class MainWindow(QMainWindow):
         }
         target_key = type_map.get(index, '10m_air_pistol')
 
+        # Save to settings
+        settings = load_settings()
+        settings['target_type'] = target_key
+        save_settings(settings)
+
         # Update shot trace canvas if it exists
         if hasattr(self, 'shot_trace_canvas'):
             self.shot_trace_canvas.set_target_type(target_key)
@@ -2698,6 +2735,11 @@ class MainWindow(QMainWindow):
         """Handle view mode dropdown change."""
         issf_enabled = (index == 0)  # First option is ISSF
 
+        # Save to settings
+        settings = load_settings()
+        settings['target_view_mode'] = 'issf' if issf_enabled else 'simple'
+        save_settings(settings)
+
         # Update shot trace canvas if it exists
         if hasattr(self, 'shot_trace_canvas'):
             self.shot_trace_canvas.set_issf_mode(issf_enabled)
@@ -2705,6 +2747,26 @@ class MainWindow(QMainWindow):
     def update_thresholds(self):
         self.detector.accel_thresh = self.spin_jerk.value()
         self.detector.piezo_thresh = self.spin_piezo.value()
+
+    def _load_settings(self):
+        """Load saved settings and apply them to UI components."""
+        settings = load_settings()
+
+        # Load target type
+        target_type = settings.get('target_type', '10m_air_pistol')
+        type_map = {'10m_air_pistol': 0, '25m_sport_pistol': 1, '50m_free_pistol': 2}
+        index = type_map.get(target_type, 0)
+        self.cmb_target_type.setCurrentIndex(index)
+
+        # Load view mode
+        view_mode = settings.get('target_view_mode', 'issf')
+        view_index = 0 if view_mode == 'issf' else 1
+        self.cmb_view_mode.setCurrentIndex(view_index)
+
+        # Apply settings to canvas
+        if hasattr(self, 'shot_trace_canvas'):
+            self.shot_trace_canvas.set_target_type(target_type)
+            self.shot_trace_canvas.set_issf_mode(view_mode == 'issf')
 
     def start_calibration(self, auto=False):
         self.calib_buffer = []
