@@ -1386,6 +1386,7 @@ class ShotTraceCanvas(QWidget):
         self.target_type = '10m_air_pistol'
         self.issf_mode = True
         self.impact_points = []
+        self.ring_radii = RING_RADII
 
     def set_trace(self, hold=None, press=None, recoil=None, score=0,
                   impact_x_cm=0.0, impact_y_cm=0.0, shot_idx=0):
@@ -1540,10 +1541,23 @@ class ShotTraceCanvas(QWidget):
         cx, cy = w // 2, h // 2
         scale = min(w, h) / (2 * self.plot_range) * 0.9 * self.scale
 
+        # Draw target (ISSF or simple rings)
+        if self.issf_mode:
+            self._draw_issf_target(painter, cx, cy, scale)
+        else:
+            # Original simple ring drawing
+            for r in self.ring_radii:
+                sx, sy = cx, cy
+                ring_rect = QRectF(sx - r * scale, sy - r * scale, r * 2 * scale, r * 2 * scale)
+                painter.setPen(QPen(QColor('#2A2A2A'), 1))
+                painter.drawEllipse(ring_rect)
+
+        # Draw crosshair center
         painter.setPen(QPen(QColor('#333333'), 1))
         painter.drawLine(cx - 20, cy, cx + 20, cy)
         painter.drawLine(cx, cy - 20, cx, cy + 20)
 
+        # Draw shot trace phases (unchanged)
         self._draw_path(painter, self.hol_x, self.hol_y, cx, cy, scale,
                         QPen(QColor(self.COL_HOLD), 2))
         self._draw_path(painter, self.pre_x, self.pre_y, cx, cy, scale,
@@ -1551,6 +1565,7 @@ class ShotTraceCanvas(QWidget):
         self._draw_path(painter, self.rec_x, self.rec_y, cx, cy, scale,
                         QPen(QColor(self.COL_RECOIL), 2))
 
+        # Draw current impact marker
         if abs(self.impact_x_cm) > 0.01 or abs(self.impact_y_cm) > 0.01:
             imp_scale = scale / self.plot_range
             imp_pix_x = cx + self.impact_x_cm * 0.01 * imp_scale
@@ -1559,6 +1574,11 @@ class ShotTraceCanvas(QWidget):
             painter.setPen(Qt.NoPen)
             painter.drawEllipse(int(imp_pix_x) - 5, int(imp_pix_y) - 5, 10, 10)
 
+        # Draw impact points overlay if in ISSF mode
+        if self.issf_mode and self.impact_points:
+            self._draw_impact_points(painter, cx, cy, scale)
+
+        # Draw shot number
         if self.current_shot_idx > 0:
             painter.setPen(QPen(QColor(COLORS['text_secondary'])))
             painter.setFont(QFont("Segoe UI", 14, QFont.Bold))
