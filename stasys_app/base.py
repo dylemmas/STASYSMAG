@@ -44,6 +44,7 @@ from PyQt5.QtGui import (
     QColor, QPainter, QPen, QRadialGradient,
     QPainterPath, QFont, QBrush, QPalette)
 from PyQt5.QtCore import QRectF
+from PyQt5.QtSvg import QSvgRenderer
 
 # ================= LOGGING =================
 logging.basicConfig(
@@ -177,6 +178,7 @@ class ISSFTargetSpec:
     ten_ring_diameter_mm: float   # 10-ring outer edge diameter
     inner_ten_mm: float            # 10.9 ring diameter
     ring_count: int = 10           # Number of scoring rings
+    svg_filename: str = ''         # Filename of SVG in image_assets/ dir
 
 TARGET_SPECS = {
     '10m_air_pistol': ISSFTargetSpec(
@@ -186,14 +188,16 @@ TARGET_SPECS = {
         ten_ring_diameter_mm=11.5,
         inner_ten_mm=5.75,
         ring_count=10,
+        svg_filename='10m ISSF.svg',
     ),
-    '25m_sport_pistol': ISSFTargetSpec(
-        name='25m Sport Pistol',
-        distance_m=25.0,
+    '20m_pistol': ISSFTargetSpec(
+        name='20m Pistol',
+        distance_m=20.0,
         total_diameter_mm=500.0,
         ten_ring_diameter_mm=50.0,
         inner_ten_mm=25.0,
         ring_count=10,
+        svg_filename='20m ISSF.svg',
     ),
     '50m_free_pistol': ISSFTargetSpec(
         name='50m Free Pistol',
@@ -202,6 +206,7 @@ TARGET_SPECS = {
         ten_ring_diameter_mm=50.0,
         inner_ten_mm=25.0,
         ring_count=10,
+        svg_filename='50m ISSF.svg',
     ),
 }
 
@@ -1478,20 +1483,67 @@ class ShotTraceCanvas(QWidget):
         painter.drawPath(path)
 
     def _draw_issf_target(self, painter, cx, cy, scale):
-        """Draw ISSF standard target with proper scoring rings and colors."""
-        spec = TARGET_SPECS[self.target_type]
+        """Draw ISSF target from SVG file, falling back to procedural rings."""
+        spec = TARGET_SPECS.get(self.target_type)
+        if not spec or not spec.svg_filename:
+            # No spec or no SVG file specified — fall back to simple rings
+            self._draw_simple_rings(painter, cx, cy, scale)
+            return
+
+        # Try to find the image_assets directory
+        from pathlib import Path
+        base_dir = Path(__file__).parent
+        svg_path = base_dir / 'image_assets' / spec.svg_filename
+
+        if not svg_path.exists():
+            # Try current directory fallback
+            svg_path = Path('stasys_app') / 'image_assets' / spec.svg_filename
+
+        if not svg_path.exists():
+            # SVG not found — fall back to simple rings
+            self._draw_simple_rings(painter, cx, cy, scale)
+            return
+
+        # Load and render SVG
+        try:
+            svg_renderer = QSvgRenderer(str(svg_path))
+        except Exception as e:
+            logger.warning("Failed to load SVG %s: %s — falling back to simple rings",
+                          svg_path, e)
+            self._draw_simple_rings(painter, cx, cy, scale)
+            return
+
+        # Calculate target size based on canvas — fit with some margin
+        target_radius = min(self.width(), self.height()) * 0.4
+
+        # Draw SVG centered at (cx, cy)
+        svg_rect = QRectF(
+            cx - target_radius,
+            cy - target_radius,
+            target_radius * 2,
+            target_radius * 2
+        )
+        svg_renderer.render(painter, svg_rect)
+
+    def _draw_simple_rings(self, painter, cx, cy, scale):
+        """Fallback: draw procedural ISSF target rings when no SVG is available."""
+        spec = TARGET_SPECS.get(self.target_type)
+        if not spec:
+            # No spec at all — draw generic rings
+            for r in self.ring_radii:
+                ring_rect = QRectF(cx - r * scale, cy - r * scale,
+                                   r * 2 * scale, r * 2 * scale)
+                painter.setPen(QPen(QColor('#2A2A2A'), 1))
+                painter.drawEllipse(ring_rect)
+            return
 
         # Convert millimetres to screen coordinates
-        # Target is displayed at actual scale relative to plot_range
-        # plot_range is in radians, need to convert to target distance
-        # Use a fixed scale factor for target display
-        target_scale_factor = scale / (self.plot_range * 100)  # Adjust for mm display
+        target_scale_factor = scale / (self.plot_range * 100)
 
         # Draw rings from outer to inner
         painter.setPen(QPen(QColor('#333333'), 1))
 
         # Ring colors: 1-3 white, 4-7 black, 8-10 black (ISSF standard)
-        # But for display we use: outer rings lighter, inner rings darker
         ring_colors = {
             1: '#FFFFFF', 2: '#FFFFFF', 3: '#FFFFFF',
             4: '#333333', 5: '#333333', 6: '#333333', 7: '#333333',
@@ -1510,7 +1562,7 @@ class ShotTraceCanvas(QWidget):
                                 spec.ten_ring_diameter_mm) / (spec.ring_count - 1)
                 radius_mm = (spec.ten_ring_diameter_mm / 2) + ((10 - ring_num) * ring_spacing)
 
-            screen_radius = radius_mm * target_scale_factor * 50  # Scale for visibility
+            screen_radius = radius_mm * target_scale_factor * 50
 
             color = ring_colors.get(ring_num, '#333333')
             painter.setBrush(QBrush(QColor(color)))
@@ -2570,7 +2622,7 @@ class MainWindow(QMainWindow):
         type_row.addWidget(type_lbl)
 
         self.cmb_target_type = QComboBox()
-        self.cmb_target_type.addItems(["10m Air Pistol", "25m Sport Pistol", "50m Free Pistol"])
+        self.cmb_target_type.addItems(["10m Air Pistol", "20m Pistol", "50m Free Pistol"])
         self.cmb_target_type.setFont(QFont("Segoe UI", 13))
         self.cmb_target_type.setStyleSheet(f"""
             QComboBox {{
@@ -2717,7 +2769,7 @@ class MainWindow(QMainWindow):
         """Handle target type dropdown change."""
         type_map = {
             0: '10m_air_pistol',
-            1: '25m_sport_pistol',
+            1: '20m_pistol',
             2: '50m_free_pistol'
         }
         target_key = type_map.get(index, '10m_air_pistol')
@@ -2754,7 +2806,7 @@ class MainWindow(QMainWindow):
 
         # Load target type
         target_type = settings.get('target_type', '10m_air_pistol')
-        type_map = {'10m_air_pistol': 0, '25m_sport_pistol': 1, '50m_free_pistol': 2}
+        type_map = {'10m_air_pistol': 0, '20m_pistol': 1, '50m_free_pistol': 2}
         index = type_map.get(target_type, 0)
         self.cmb_target_type.setCurrentIndex(index)
 
