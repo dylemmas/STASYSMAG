@@ -1383,6 +1383,9 @@ class ShotTraceCanvas(QWidget):
         self.current_shot_idx = 0
         self.scale = 1.0
         self.plot_range = PLOT_RANGE
+        self.target_type = '10m_air_pistol'
+        self.issf_mode = True
+        self.impact_points = []
 
     def set_trace(self, hold=None, press=None, recoil=None, score=0,
                   impact_x_cm=0.0, impact_y_cm=0.0, shot_idx=0):
@@ -1403,6 +1406,26 @@ class ShotTraceCanvas(QWidget):
         self.impact_x_cm = 0.0
         self.impact_y_cm = 0.0
         self.current_shot_idx = 0
+        self.impact_points = []
+        self.update()
+
+    def set_target_type(self, type_key: str):
+        """Set the target type for ISSF rendering."""
+        if type_key not in TARGET_SPECS:
+            logger.warning(f"Unknown target type: {type_key}, defaulting to 10m_air_pistol")
+            self.target_type = '10m_air_pistol'
+        else:
+            self.target_type = type_key
+        self.update()
+
+    def set_issf_mode(self, enabled: bool):
+        """Enable or disable ISSF target rendering mode."""
+        self.issf_mode = enabled
+        self.update()
+
+    def add_impact_point(self, x_cm: float, y_cm: float, score: float):
+        """Add an impact point for overlay display."""
+        self.impact_points.append((x_cm, y_cm, score))
         self.update()
 
     def set_scale(self, s):
