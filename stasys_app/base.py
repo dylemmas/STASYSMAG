@@ -1719,6 +1719,10 @@ class PerShotStatsWidget(QWidget):
         self._imp_lbl.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px;")
         layout.addWidget(self._imp_lbl)
 
+        self._issf_score_lbl = QLabel("ISSF: --")
+        self._issf_score_lbl.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px; font-weight: 600;")
+        layout.addWidget(self._issf_score_lbl)
+
         layout.addStretch()
 
     def populate(self, shot):
@@ -1758,6 +1762,11 @@ class PerShotStatsWidget(QWidget):
         iy = shot.get('impact_y_cm', 0) or 0
         self._imp_lbl.setText(f"Impact: ({ix:+.1f}, {iy:+.1f}) cm")
 
+        # NEW: Calculate and display ISSF score
+        target_spec = TARGET_SPECS.get('10m_air_pistol', TARGET_SPECS['10m_air_pistol'])
+        issf_score, ring = calculate_issf_score(ix, iy, target_spec)
+        self._issf_score_lbl.setText(f"ISSF: {issf_score:.1f} (Ring {ring})")
+
     def _score_color(self, score):
         if score >= 95: return COLORS.get('score_elite', COLORS['accent_good'])
         if score >= 85: return COLORS.get('score_expert', COLORS['accent_good'])
@@ -1792,6 +1801,7 @@ class PerShotStatsWidget(QWidget):
             f"font-size: 12px; font-weight: 700; color: {COLORS['text_secondary']};")
         self._err_lbl.setVisible(False)
         self._imp_lbl.setText("Impact: (--, --)")
+        self._issf_score_lbl.setText("ISSF: --")  # NEW: Clear ISSF label
 
 
 class SessionStatsWidget(QWidget):
