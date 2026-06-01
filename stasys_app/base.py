@@ -2513,6 +2513,91 @@ class MainWindow(QMainWindow):
         settings_title.setStyleSheet(f"color: {COLORS['text_primary']};")
         tab4_layout.addWidget(settings_title)
 
+        # Target Settings Section
+        target_section = QFrame()
+        target_section.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['bg_secondary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
+                padding: 16px;
+            }}
+        """)
+        target_layout = QVBoxLayout(target_section)
+
+        target_title = QLabel("Target Settings")
+        target_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        target_title.setStyleSheet(f"color: {COLORS['accent_good']};")
+        target_layout.addWidget(target_title)
+
+        # Target Type Dropdown
+        type_row = QHBoxLayout()
+        type_lbl = QLabel("Target Type:")
+        type_lbl.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 13px;")
+        type_lbl.setFixedWidth(100)
+        type_row.addWidget(type_lbl)
+
+        self.cmb_target_type = QComboBox()
+        self.cmb_target_type.addItems(["10m Air Pistol", "25m Sport Pistol", "50m Free Pistol"])
+        self.cmb_target_type.setFont(QFont("Segoe UI", 13))
+        self.cmb_target_type.setStyleSheet(f"""
+            QComboBox {{
+                background: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                border: 2px solid {COLORS['border']};
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 13px;
+            }}
+            QComboBox::drop-down {{ border: none; }}
+            QComboBox QAbstractItemView {{
+                background: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                selection-background-color: {COLORS['accent_good']};
+                selection-color: #000000;
+            }}
+        """)
+        self.cmb_target_type.currentIndexChanged.connect(self.change_target_type)
+        type_row.addWidget(self.cmb_target_type, 1)
+        target_layout.addLayout(type_row)
+
+        # View Mode Dropdown
+        view_row = QHBoxLayout()
+        view_lbl = QLabel("Target View:")
+        view_lbl.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 13px;")
+        view_lbl.setFixedWidth(100)
+        view_row.addWidget(view_lbl)
+
+        self.cmb_view_mode = QComboBox()
+        self.cmb_view_mode.addItems(["ISSF Target", "Simple Rings"])
+        self.cmb_view_mode.setFont(QFont("Segoe UI", 13))
+        self.cmb_view_mode.setStyleSheet(f"""
+            QComboBox {{
+                background: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                border: 2px solid {COLORS['border']};
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 13px;
+            }}
+            QComboBox::drop-down {{ border: none; }}
+            QComboBox QAbstractItemView {{
+                background: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                selection-background-color: {COLORS['accent_good']};
+                selection-color: #000000;
+            }}
+        """)
+        self.cmb_view_mode.setCurrentIndex(0)  # Default to ISSF
+        self.cmb_view_mode.currentIndexChanged.connect(self.change_view_mode)
+        view_row.addWidget(self.cmb_view_mode, 1)
+        target_layout.addLayout(view_row)
+
+        tab4_layout.addWidget(target_section)
+        tab4_layout.addSpacing(16)
+
         # COM Port
         port_label = QLabel("COM Port")
         port_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; text-transform: uppercase; letter-spacing: 1px;")
@@ -2595,6 +2680,27 @@ class MainWindow(QMainWindow):
         else:
             self.spin_jerk.setValue(DEFAULT_ACCEL_THRESH)
             self.spin_piezo.setValue(DEFAULT_PIEZO_MIN)
+
+    def change_target_type(self, index):
+        """Handle target type dropdown change."""
+        type_map = {
+            0: '10m_air_pistol',
+            1: '25m_sport_pistol',
+            2: '50m_free_pistol'
+        }
+        target_key = type_map.get(index, '10m_air_pistol')
+
+        # Update shot trace canvas if it exists
+        if hasattr(self, 'shot_trace_canvas'):
+            self.shot_trace_canvas.set_target_type(target_key)
+
+    def change_view_mode(self, index):
+        """Handle view mode dropdown change."""
+        issf_enabled = (index == 0)  # First option is ISSF
+
+        # Update shot trace canvas if it exists
+        if hasattr(self, 'shot_trace_canvas'):
+            self.shot_trace_canvas.set_issf_mode(issf_enabled)
 
     def update_thresholds(self):
         self.detector.accel_thresh = self.spin_jerk.value()
