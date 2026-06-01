@@ -1447,6 +1447,90 @@ class ShotTraceCanvas(QWidget):
         painter.setPen(pen)
         painter.drawPath(path)
 
+    def _draw_issf_target(self, painter, cx, cy, scale):
+        """Draw ISSF standard target with proper scoring rings and colors."""
+        spec = TARGET_SPECS[self.target_type]
+
+        # Convert millimetres to screen coordinates
+        # Target is displayed at actual scale relative to plot_range
+        # plot_range is in radians, need to convert to target distance
+        # Use a fixed scale factor for target display
+        target_scale_factor = scale / (self.plot_range * 100)  # Adjust for mm display
+
+        # Draw rings from outer to inner
+        painter.setPen(QPen(QColor('#333333'), 1))
+
+        # Ring colors: 1-3 white, 4-7 black, 8-10 black (ISSF standard)
+        # But for display we use: outer rings lighter, inner rings darker
+        ring_colors = {
+            1: '#FFFFFF', 2: '#FFFFFF', 3: '#FFFFFF',
+            4: '#333333', 5: '#333333', 6: '#333333', 7: '#333333',
+            8: '#000000', 9: '#000000', 10: '#000000'
+        }
+
+        for ring_num in range(spec.ring_count, 0, -1):
+            # Calculate ring diameter
+            if ring_num == 10:
+                radius_mm = spec.ten_ring_diameter_mm / 2
+            elif ring_num == 1:
+                radius_mm = spec.total_diameter_mm / 2
+            else:
+                # Interpolate between 10-ring and outer edge
+                ring_spacing = (spec.total_diameter_mm -
+                                spec.ten_ring_diameter_mm) / (spec.ring_count - 1)
+                radius_mm = (spec.ten_ring_diameter_mm / 2) + ((10 - ring_num) * ring_spacing)
+
+            screen_radius = radius_mm * target_scale_factor * 50  # Scale for visibility
+
+            color = ring_colors.get(ring_num, '#333333')
+            painter.setBrush(QBrush(QColor(color)))
+            painter.setPen(QPen(QColor('#666666'), 1))
+
+            rect = QRectF(cx - screen_radius, cy - screen_radius,
+                         screen_radius * 2, screen_radius * 2)
+            painter.drawEllipse(rect)
+
+        # Draw inner 10-ring (10.9 zone indicator)
+        inner_radius = (spec.inner_ten_mm / 2) * target_scale_factor * 50
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(COLORS['accent_good']), 1))
+        inner_rect = QRectF(cx - inner_radius, cy - inner_radius,
+                            inner_radius * 2, inner_radius * 2)
+        painter.drawEllipse(inner_rect)
+
+    def _draw_impact_points(self, painter, cx, cy, scale):
+        """Draw shot impact points overlay with color coding by score."""
+        target_scale_factor = scale / (self.plot_range * 100)
+
+        for x_cm, y_cm, score in self.impact_points:
+            # Convert impact position to screen coordinates
+            screen_x = cx + (x_cm * 10 * target_scale_factor * 50)
+            screen_y = cy - (y_cm * 10 * target_scale_factor * 50)
+
+            # Color code by score
+            if score >= 10.0:
+                color = QColor(COLORS['accent_good'])  # Green for 10+
+            elif score >= 8.0:
+                color = QColor(COLORS['accent_ok'])    # Yellow for 8-9
+            elif score > 0:
+                color = QColor(COLORS['accent_bad'])   # Red for 1-7
+            else:
+                color = QColor(COLORS['text_muted'])   # Gray for miss
+
+            if score == 0.0:
+                # Draw 'X' for miss
+                painter.setPen(QPen(color, 2))
+                marker_size = 6
+                painter.drawLine(int(screen_x - marker_size), int(screen_y - marker_size),
+                                int(screen_x + marker_size), int(screen_y + marker_size))
+                painter.drawLine(int(screen_x + marker_size), int(screen_y - marker_size),
+                                int(screen_x - marker_size), int(screen_y + marker_size))
+            else:
+                # Draw circle for hit
+                painter.setBrush(QBrush(color))
+                painter.setPen(Qt.NoPen)
+                painter.drawEllipse(int(screen_x) - 4, int(screen_y) - 4, 8, 8)
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
