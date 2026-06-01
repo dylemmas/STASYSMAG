@@ -2873,6 +2873,18 @@ class MainWindow(QMainWindow):
                     shot_idx=len(self.list_history) + 1,
                 )
 
+                # Add impact point to canvas
+                if self.shot_trace_canvas:
+                    # Calculate ISSF score for this shot
+                    ix = shot_res.get('impact_x_cm', 0) or 0
+                    iy = shot_res.get('impact_y_cm', 0) or 0
+                    target_spec = TARGET_SPECS.get(self.shot_trace_canvas.target_type,
+                                                   TARGET_SPECS['10m_air_pistol'])
+                    issf_score, _ = calculate_issf_score(ix, iy, target_spec)
+
+                    # Add impact point to canvas
+                    self.shot_trace_canvas.add_impact_point(ix, iy, issf_score)
+
                 # Per-shot stats
                 self.per_shot_stats.populate(shot_res)
 
