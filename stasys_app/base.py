@@ -205,6 +205,56 @@ TARGET_SPECS = {
 }
 
 
+def calculate_issf_score(impact_x_cm: float, impact_y_cm: float,
+                        target_spec: ISSFTargetSpec) -> Tuple[float, int]:
+    """
+    Convert impact position to ISSF decimal score.
+
+    Args:
+        impact_x_cm: X offset from center (cm) at target distance
+        impact_y_cm: Y offset from center (cm) at target distance
+        target_spec: Target specification with dimensions
+
+    Returns:
+        (decimal_score, ring_number)
+        Examples: (10.9, 10) for center, (8.5, 8), (0.0, 0) for miss
+    """
+    # Calculate radial distance from center in millimetres
+    distance_mm = math.sqrt(impact_x_cm**2 + impact_y_cm**2) * 10.0
+
+    # Check for miss (outside target area)
+    target_radius_mm = target_spec.total_diameter_mm / 2.0
+    if distance_mm > target_radius_mm:
+        return (0.0, 0)
+
+    # Determine ring number (1-10)
+    # Calculate spacing between rings outside the 10-ring
+    ring_spacing = (target_spec.total_diameter_mm -
+                    target_spec.ten_ring_diameter_mm) / (target_spec.ring_count - 1)
+
+    if distance_mm < target_spec.inner_ten_mm / 2.0:
+        # Inside inner-ten zone: calculate decimal score (10.0 to 10.9)
+        ring = 10
+        # Center = 10.9, outer edge of inner-ten = 10.0
+        # inner_ten_mm is diameter, so radius is inner_ten_mm / 2
+        inner_ten_radius_mm = target_spec.inner_ten_mm / 2.0
+        decimal = 10.9 * (1.0 - (distance_mm / inner_ten_radius_mm)) + 10.0 * (distance_mm / inner_ten_radius_mm)
+    elif distance_mm < target_spec.ten_ring_diameter_mm / 2.0:
+        # In the 10-ring but outside inner-ten zone
+        ring = 10
+        decimal = 10.0
+    else:
+        # Outside 10-ring: calculate which ring
+        # At exactly 10-ring edge, we start at ring 9
+        distance_from_ten_edge = distance_mm - (target_spec.ten_ring_diameter_mm / 2.0)
+        # Add tiny epsilon to handle exact boundary: ceil(0 + epsilon) = 1
+        ring = int(10 - math.ceil(max(0, distance_from_ten_edge / ring_spacing) + 1e-9))
+        ring = max(1, min(10, ring))
+        decimal = float(ring)
+
+    return (round(decimal, 1), ring)
+
+
 # ================= MANTISX-STYLE COLORS =================
 COLORS = {
     'bg_primary':    '#0D0D0D',
