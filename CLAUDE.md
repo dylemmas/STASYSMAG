@@ -12,7 +12,7 @@ The system has two main components:
 
 **Hardware:** ESP32 DEVKITV1 + MPU6050 IMU + piezo knock sensor + Li-Ion battery with TP4056 charger
 
-**Use cases:** Dry fire and live fire training for pistol, rifle, archery, and shotgun
+**Use cases:** Dry fire and live fire training for pistol, rifle, archery, and shotgun (attached on the bottom of the gun)
 
 ## Build Commands
 

@@ -3,3 +3,18 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Runtime / local data
+*.db
+stasys_app/shooter_data.db
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

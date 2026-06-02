@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="500" height="500">
+  <rect width="200" height="200" fill="#ffffff" />
+  
+  <g transform="translate(100, 100)">
+    <circle r="77.2" fill="none" stroke="#000000" stroke-width="1" />
+    <circle r="69.2" fill="none" stroke="#000000" stroke-width="1" />
+    <circle r="61.2" fill="none" stroke="#000000" stroke-width="1" />
+    
+    <circle r="56.2" fill="#111111" />
+    
+    <circle r="53.2" fill="none" stroke="#ffffff" stroke-width="1" />
+    <circle r="45.2" fill="none" stroke="#ffffff" stroke-width="1" />
+    <circle r="37.2" fill="none" stroke="#ffffff" stroke-width="1" />
+    <circle r="29.2" fill="none" stroke="#ffffff" stroke-width="1" />
+    <circle r="21.2" fill="none" stroke="#ffffff" stroke-width="1" />
+    <circle r="13.2" fill="none" stroke="#ffffff" stroke-width="1" />
+    <circle r="5.2" fill="none" stroke="#ffffff" stroke-width="1" />
+  </g>
+</svg>
