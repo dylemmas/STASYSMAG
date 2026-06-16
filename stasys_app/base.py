@@ -38,7 +38,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QLabel, QListWidget,
     QComboBox, QDoubleSpinBox, QGridLayout, QFrame,
-    QProgressBar, QTabWidget, QSplitter)
+    QProgressBar, QTabWidget, QSplitter, QSlider,
+    QScrollArea, QSizePolicy)
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import (
     QColor, QPainter, QPen, QRadialGradient,
@@ -73,10 +74,17 @@ STABILITY_GYRO_LIMIT       = 4.0
 STABILITY_GYRO_DISARM_MULT = 3.0
 ARMED_ROT_LIMIT            = 6.0
 
-HOLD_DURATION_IDX    = 150
-PRESS_DURATION_IDX   = 30
-RECOIL_DURATION_IDX  = 10
-TOTAL_HISTORY_NEEDED = HOLD_DURATION_IDX + RECOIL_DURATION_IDX + 10
+# Rotation speed must stay below this many consecutive samples before
+# a shot is allowed while ARMED. Configurable from the Settings tab.
+DEFAULT_SHOT_ROTATION_LIMIT = 4.0  # rad/s
+SHOT_STABILITY_MIN_SAMPLES  = 10   # 100ms @ 100Hz
+
+HOLD_DURATION_IDX     = 100   # 1.0s pre-shot stability window (1000–2000ms before break)
+PRESS_DURATION_IDX    = 15    # 0.15s trigger-pull window (150–300ms before break)
+RECOIL_DURATION_IDX   = 50    # 0.5s follow-through window (500–1000ms after break)
+HOLD_GAP_BEFORE_BREAK = 200   # farthest look-back for Hold: 2000ms = 200 samples
+TOTAL_HISTORY_NEEDED  = HOLD_GAP_BEFORE_BREAK + RECOIL_DURATION_IDX + 10
+SHOT_PHASE_TOTAL      = HOLD_DURATION_IDX + PRESS_DURATION_IDX + RECOIL_DURATION_IDX
 
 # --- PIEZO RANGE FIX ---
 # Old firmware (~1kHz sampling) produced values 20-50 at idle, 50-200 on dryfire
@@ -129,7 +137,7 @@ A2C_FLINCH_THRESH       = 0.015    # rad — flinch detection threshold
 
 # ── Target & Impact ────────────────────────────────────────────────────────────
 DEFAULT_TARGET_DISTANCE = 10.0     # metres
-TRAIL_MOVEMENT_THRESHOLD = 0.0005  # rad — min movement to draw trail segment
+
 
 # ── Firearm / Training Mode ────────────────────────────────────────────────────
 DEFAULT_FIREARM       = 'Pistol'
@@ -643,7 +651,7 @@ def log_shot_trace(session_id, shot_number, score, piezo, aim_trace, mode,
                          impact_x_cm, impact_y_cm, target_distance,
                          piezo_value, aim_trace,
                          firearm, training_mode)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                     (session_id, shot_number, datetime.now(), score, grade,
                      a2c_angle, a2c_mag, hold_score, press_score,
                      recoil_score, ft_score, hold_stability,
@@ -839,6 +847,73 @@ def perform_auth(ser):
     return False
 
 
+# ================= DEVICE DISCOVERY =================
+
+def discover_stasys_devices() -> List[Tuple[str, str]]:
+    """Scan all COM ports and return those that complete the STASYS handshake.
+
+    For each port: opens it, waits for READY, then performs the full auth handshake.
+    Returns a live serial.Serial object on success (NOT closed).
+
+    Returns:
+        List of (serial.Serial, description) tuples. First match wins.
+    """
+    found: List[Tuple[serial.Serial, str]] = []
+    candidates = [p.device for p in serial.tools.list_ports.comports()]
+    for port in sorted(candidates):
+        probe_ser = None
+        try:
+            probe_ser = serial.Serial(port, BAUD_RATE, timeout=1.0)
+            probe_ser.reset_input_buffer()
+            time.sleep(1.5)  # wait for firmware READY broadcast
+
+            ready_found = False
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if probe_ser.in_waiting:
+                    line = probe_ser.readline().decode('utf-8', errors='ignore').strip()
+                    if "READY" in line:
+                        ready_found = True
+                        break
+                time.sleep(0.05)
+
+            if not ready_found:
+                continue
+
+            # Full auth handshake: send challenge, verify response
+            challenge = ''.join(
+                random.choices(string.ascii_letters + string.digits,
+                               k=AUTH_CHALLENGE_LENGTH))
+            probe_ser.write(f"{challenge}\n".encode('utf-8'))
+
+            resp_found = False
+            auth_deadline = time.time() + AUTH_RESPONSE_TIMEOUT
+            while time.time() < auth_deadline:
+                if probe_ser.in_waiting:
+                    resp = probe_ser.readline().decode('utf-8', errors='ignore').strip()
+                    if not resp:
+                        continue
+                    expected = hashlib.sha256(
+                        (challenge + SECRET_KEY.decode('utf-8')).encode()
+                    ).hexdigest()
+                    if hmac.compare_digest(resp.lower(), expected.lower()):
+                        desc = getattr(probe_ser, 'description', '') or ''
+                        found.append((probe_ser, desc or port))
+                        logger.info("Found STASYS device on %s (%s)", port, desc or port)
+                        return found  # return alive connection immediately
+                    logger.warning("[AUTH] Hash mismatch — got: %r", resp)
+                time.sleep(0.01)
+
+        except OSError:
+            continue
+        except Exception:
+            continue
+        finally:
+            if probe_ser and probe_ser.is_open and probe_ser not in [f[0] for f in found]:
+                probe_ser.close()
+    return found
+
+
 # ================= CORE LOGIC =================
 
 class ShotDetector:
@@ -900,10 +975,11 @@ class ShotDetector:
         self.stationary_count    = 0
         self.stationary_needed   = 30       # ~0.5s of stillness
 
-        # Raw gyro storage for stationary detection
-        self.gx_raw = 0.0
-        self.gy_raw = 0.0
-        self.gz_raw = 0.0
+        # In-arm stability gate: require consecutive samples below rotation_limit
+        # before a shot can trigger, even after the device is ARMED.
+        self.rotation_limit       = DEFAULT_SHOT_ROTATION_LIMIT
+        self._stable_under_count  = 0
+        self._stable_under_needed = 10      # 100ms @ 100Hz
 
     # ── Calibration & Tare ───────────────────────────────────────────────────
 
@@ -1063,25 +1139,39 @@ class ShotDetector:
                     triggered = True
             else:
                 if self.piezo_thresh <= piezo <= PIEZO_MAX_LIMIT:
-                    if rot_mag < ARMED_ROT_LIMIT:
-                        triggered = True
-                    else:
-                        logger.debug(
-                            "Piezo OK (%d) but rotation too high (%.2f > %.1f)",
-                            piezo, rot_mag, ARMED_ROT_LIMIT)
+                    triggered = True
                 elif piezo > 0:
                     logger.debug(
                         "Piezo %d outside range [%.0f, %.0f]",
                         piezo, self.piezo_thresh, PIEZO_MAX_LIMIT)
 
+            # ── Stability counter — update every sample, gate trigger ───
+            if rot_mag < self.rotation_limit:
+                self._stable_under_count += 1
+            else:
+                if self._stable_under_count > 0:
+                    logger.debug(
+                        "Stability counter reset — rotation %.2f >= limit %.2f",
+                        rot_mag, self.rotation_limit)
+                self._stable_under_count = 0
+
             if triggered:
-                logger.info("SHOT TRIGGERED — Piezo: %d, Rot: %.2f", piezo, rot_mag)
-                self.last_trigger_piezo = piezo
-                self.state          = "POST_GATHER"
-                self.gather_counter = RECOIL_DURATION_IDX
+                if self._stable_under_count >= self._stable_under_needed:
+                    logger.info(
+                        "SHOT TRIGGERED — Piezo: %d, Rot: %.2f, stable: %d",
+                        piezo, rot_mag, self._stable_under_count)
+                    self.last_trigger_piezo = piezo
+                    self.state          = "POST_GATHER"
+                    self.gather_counter = RECOIL_DURATION_IDX
+                    self._stable_under_count = 0
+                else:
+                    logger.debug(
+                        "Trigger pending — stable %d/%d samples",
+                        self._stable_under_count, self._stable_under_needed)
 
             if rot_mag > (STABILITY_GYRO_LIMIT * STABILITY_GYRO_DISARM_MULT):
                 self.state = "IDLE"
+                self._stable_under_count = 0
 
         elif self.state == "POST_GATHER":
             self.gather_counter -= 1
@@ -1194,7 +1284,7 @@ class ShotDetector:
 
     def analyze_shot(self):
         hist_len     = len(self.trace_x)
-        total_needed = HOLD_DURATION_IDX + RECOIL_DURATION_IDX
+        total_needed = HOLD_GAP_BEFORE_BREAK + RECOIL_DURATION_IDX
         if hist_len < total_needed:
             return None
 
@@ -1204,7 +1294,8 @@ class ShotDetector:
         idx_recoil_end  = len(full_x)
         idx_break       = idx_recoil_end - RECOIL_DURATION_IDX
         idx_press_start = idx_break - PRESS_DURATION_IDX
-        idx_hold_start  = idx_break - HOLD_DURATION_IDX
+        idx_hold_start  = idx_break - HOLD_GAP_BEFORE_BREAK
+        idx_hold_end    = idx_hold_start + HOLD_DURATION_IDX
         if idx_hold_start < 0:
             return None
 
@@ -1216,7 +1307,7 @@ class ShotDetector:
                 [x - break_x for x in full_x[start:end]],
                 [y - break_y for y in full_y[start:end]])
 
-        hold_x,   hold_y   = get_norm_segment(idx_hold_start,  idx_press_start)
+        hold_x,   hold_y   = get_norm_segment(idx_hold_start,  idx_hold_end)
         press_x,  press_y  = get_norm_segment(idx_press_start, idx_break + 1)
         recoil_x, recoil_y = get_norm_segment(idx_break,       idx_recoil_end)
 
@@ -1376,14 +1467,8 @@ class AimCanvas(QWidget):
                 sx0, sy0 = world_to_screen(pts[0], pts_y[0])
                 path.moveTo(sx0, sy0)
                 for i in range(1, len(pts)):
-                    dx = pts[i] - pts[i - 1]
-                    dy = pts_y[i] - pts_y[i - 1]
-                    dist = math.sqrt(dx * dx + dy * dy)
                     sx, sy = world_to_screen(pts[i], pts_y[i])
-                    if dist > TRAIL_MOVEMENT_THRESHOLD:
-                        path.lineTo(sx, sy)
-                    else:
-                        path.moveTo(sx, sy)
+                    path.lineTo(sx, sy)
                 painter.setPen(trail_pen)
                 painter.drawPath(path)
 
@@ -1399,11 +1484,11 @@ class AimCanvas(QWidget):
 
 
 class ShotTraceCanvas(QWidget):
-    """Shot trace canvas with 3 phases: Hold (red), Press (yellow), Recoil (cyan)."""
+    """Shot trace canvas with 3 phases: Pre-Shot (red), Press (green), Follow-Through (blue)."""
 
-    COL_HOLD  = '#FF0000'
-    COL_PRESS = '#FFFF00'
-    COL_RECOIL = '#00FFFF'
+    COL_HOLD   = '#FF5252'   # red   — pre-shot stability
+    COL_PRESS  = '#00D26A'   # green — trigger pull
+    COL_RECOIL = '#2196F3'   # blue  — follow through
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1422,6 +1507,13 @@ class ShotTraceCanvas(QWidget):
         self.impact_points = []
         self.ring_radii = RING_RADII
 
+        # Replay state (set by set_trace / clear_trace)
+        self.playback_pos = 0
+        self.replay_mode = False
+        self._hold_end = 0
+        self._press_end = 0
+        self._total = 0
+
     def set_trace(self, hold=None, press=None, recoil=None, score=0,
                   impact_x_cm=0.0, impact_y_cm=0.0, shot_idx=0):
         self.hol_x, self.hol_y = (hold if hold else ([], []))
@@ -1431,6 +1523,15 @@ class ShotTraceCanvas(QWidget):
         self.impact_x_cm = impact_x_cm
         self.impact_y_cm = impact_y_cm
         self.current_shot_idx = shot_idx
+
+        n_hol = len(self.hol_x)
+        n_pre = len(self.pre_x)
+        n_reco = len(self.rec_x)
+        self._hold_end = n_hol
+        self._press_end = n_hol + n_pre
+        self._total = n_hol + n_pre + n_reco
+        self.playback_pos = 0
+        self.replay_mode = True
         self.update()
 
     def clear_trace(self):
@@ -1442,6 +1543,11 @@ class ShotTraceCanvas(QWidget):
         self.impact_y_cm = 0.0
         self.current_shot_idx = 0
         self.impact_points = []
+        self.replay_mode = False
+        self.playback_pos = 0
+        self._hold_end = 0
+        self._press_end = 0
+        self._total = 0
         self.update()
 
     def set_target_type(self, type_key: str):
@@ -1472,6 +1578,29 @@ class ShotTraceCanvas(QWidget):
         self.scale = max(0.5, min(5.0, self.scale * factor))
         self.update()
 
+    def _current_sample_xy(self):
+        """Return (x, y) of the sample at playback_pos, or last sample if at end.
+
+        Used to position the vertical replay cursor. Returns (0.0, 0.0) when
+        no trace data is loaded.
+        """
+        pos = self.playback_pos
+        if pos < self._hold_end and pos < len(self.hol_x):
+            return self.hol_x[pos], self.hol_y[pos]
+        offset = pos - self._hold_end
+        if pos < self._press_end and offset < len(self.pre_x):
+            return self.pre_x[offset], self.pre_y[offset]
+        offset = pos - self._press_end
+        if 0 <= offset < len(self.rec_x):
+            return self.rec_x[offset], self.rec_y[offset]
+        if self.rec_x:
+            return self.rec_x[-1], self.rec_y[-1]
+        if self.pre_x:
+            return self.pre_x[-1], self.pre_y[-1]
+        if self.hol_x:
+            return self.hol_x[-1], self.hol_y[-1]
+        return 0.0, 0.0
+
     def _draw_path(self, painter, xs, ys, cx, cy, scale, pen):
         if len(xs) < 2:
             return
@@ -1479,6 +1608,20 @@ class ShotTraceCanvas(QWidget):
         path.moveTo(cx + xs[0] * scale, cy - ys[0] * scale)
         for i in range(1, len(xs)):
             path.lineTo(cx + xs[i] * scale, cy - ys[i] * scale)
+        painter.setPen(pen)
+        painter.drawPath(path)
+
+    def _draw_bridge(self, painter, prev_x, prev_y, next_x, next_y,
+                     cx, cy, scale, pen):
+        """Draw a single line segment bridging two phase endpoints.
+
+        Used during replay so the line does not visually jump between
+        phases; the bridge is drawn in the *next* phase's color so it
+        reads as the start of the new phase.
+        """
+        path = QPainterPath()
+        path.moveTo(cx + prev_x * scale, cy - prev_y * scale)
+        path.lineTo(cx + next_x * scale, cy - next_y * scale)
         painter.setPen(pen)
         painter.drawPath(path)
 
@@ -1638,13 +1781,66 @@ class ShotTraceCanvas(QWidget):
         painter.drawLine(cx - 20, cy, cx + 20, cy)
         painter.drawLine(cx, cy - 20, cx, cy + 20)
 
-        # Draw shot trace phases (unchanged)
-        self._draw_path(painter, self.hol_x, self.hol_y, cx, cy, scale,
-                        QPen(QColor(self.COL_HOLD), 2))
-        self._draw_path(painter, self.pre_x, self.pre_y, cx, cy, scale,
-                        QPen(QColor(self.COL_PRESS), 3))
-        self._draw_path(painter, self.rec_x, self.rec_y, cx, cy, scale,
-                        QPen(QColor(self.COL_RECOIL), 2))
+        # Draw aim trace progressively during replay (steady aim -> trigger pull
+        # -> follow-through) so the user sees a line "generating" in time order.
+        # Outside of replay mode the full trace is shown as one continuous
+        # polyline — phase colors still distinguish the segments, but there
+        # is no gap between the end of one phase and the start of the next.
+        pos = self.playback_pos if self.replay_mode else self._total
+        n_hol = min(pos, self._hold_end)
+        n_pre = min(max(pos - self._hold_end, 0), self._press_end - self._hold_end)
+        n_reco = min(max(pos - self._press_end, 0), self._total - self._press_end)
+
+        if self.replay_mode:
+            # Replay: each phase draws its own sub-path in its own color so
+            # the user sees color appear as the line generates. A short
+            # bridge from the previous phase's last point into the new
+            # phase's first point keeps the line visually continuous.
+            if n_hol > 0:
+                self._draw_path(painter, self.hol_x[:n_hol], self.hol_y[:n_hol],
+                                cx, cy, scale, QPen(QColor(self.COL_HOLD), 5))
+            if n_pre > 0:
+                if n_hol > 0 and self.hol_x and self.pre_x:
+                    self._draw_bridge(painter,
+                                      self.hol_x[-1], self.hol_y[-1],
+                                      self.pre_x[0], self.pre_y[0],
+                                      cx, cy, scale,
+                                      QPen(QColor(self.COL_PRESS), 5))
+                self._draw_path(painter, self.pre_x[:n_pre], self.pre_y[:n_pre],
+                                cx, cy, scale, QPen(QColor(self.COL_PRESS), 5))
+            if n_reco > 0:
+                if n_pre > 0 and self.pre_x and self.rec_x:
+                    self._draw_bridge(painter,
+                                      self.pre_x[-1], self.pre_y[-1],
+                                      self.rec_x[0], self.rec_y[0],
+                                      cx, cy, scale,
+                                      QPen(QColor(self.COL_RECOIL), 5))
+                self._draw_path(painter, self.rec_x[:n_reco], self.rec_y[:n_reco],
+                                cx, cy, scale, QPen(QColor(self.COL_RECOIL), 5))
+        else:
+            # Full-trace view: build one continuous QPainterPath across all
+            # three phases so the line is unbroken, then stroke it once per
+            # phase in that phase's color. Cumulative ranges keep later
+            # colors overwriting earlier ones, so the final color at every
+            # sample is its phase color — and the line is connected.
+            full_x = self.hol_x + self.pre_x + self.rec_x
+            full_y = self.hol_y + self.pre_y + self.rec_y
+            for n, color in ((n_hol, self.COL_HOLD),
+                             (n_hol + n_pre, self.COL_PRESS),
+                             (n_hol + n_pre + n_reco, self.COL_RECOIL)):
+                if n > 1:
+                    self._draw_path(painter, full_x[:n], full_y[:n],
+                                    cx, cy, scale, QPen(QColor(color), 5))
+
+        # Current-position marker: small yellow dot at the live sample so the
+        # viewer can see "where the aim is right now" as the line generates.
+        if self.replay_mode and 0 < pos < self._total:
+            sx, sy = self._current_sample_xy()
+            marker_px = cx + sx * scale
+            marker_py = cy - sy * scale
+            painter.setBrush(QBrush(QColor('#FFEB3B')))
+            painter.setPen(QPen(QColor('#000000'), 1))
+            painter.drawEllipse(int(marker_px) - 5, int(marker_py) - 5, 10, 10)
 
         # Draw current impact marker
         if abs(self.impact_x_cm) > 0.01 or abs(self.impact_y_cm) > 0.01:
@@ -1664,6 +1860,144 @@ class ShotTraceCanvas(QWidget):
             painter.setPen(QPen(QColor(COLORS['text_secondary'])))
             painter.setFont(QFont("Segoe UI", 14, QFont.Bold))
             painter.drawText(20, 30, f"Shot #{self.current_shot_idx}")
+
+
+class ReplayBar(QWidget):
+    """Playback controls for ShotTraceCanvas replay.
+
+    Owns its own QTimer. Knows nothing about the canvas — communicates
+    via Qt signals that MainWindow connects to.
+    """
+
+    playToggled = pyqtSignal()
+    skipToStart = pyqtSignal()
+    skipToEnd = pyqtSignal()
+    stepRequested = pyqtSignal(int)
+    scrubRequested = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._on_tick)
+        self._total = SHOT_PHASE_TOTAL
+        self._position = 0
+        self._playing = False
+
+        # Build controls
+        self.btn_skip_start = QPushButton("|◀")
+        self.btn_step_back = QPushButton("◀◀")
+        self.btn_play = QPushButton("▶")
+        self.btn_step_fwd = QPushButton("▶▶")
+        self.btn_skip_end = QPushButton("▶|")
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, self._total)
+        self.lbl_position = QLabel(f"0 / {SHOT_PHASE_TOTAL}")
+
+        # Style buttons (minimal, flat, simple)
+        btn_style = f"""
+            QPushButton {{
+                background: transparent;
+                color: {COLORS['text_primary']};
+                border: none;
+                font-size: 16px;
+                padding: 4px 8px;
+            }}
+            QPushButton:hover {{
+                color: {COLORS['accent_blue']};
+            }}
+        """
+        for btn in [self.btn_skip_start, self.btn_step_back, self.btn_play,
+                    self.btn_step_fwd, self.btn_skip_end]:
+            btn.setFixedSize(40, 32)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(btn_style)
+
+        slider_style = f"""
+            QSlider::groove:horizontal {{
+                background: {COLORS['bg_tertiary']};
+                height: 6px;
+                border-radius: 3px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {COLORS['accent_blue']};
+                width: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {COLORS['accent_blue']};
+                border-radius: 3px;
+            }}
+        """
+        self.slider.setStyleSheet(slider_style)
+
+        # Layout
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(12)
+        layout.addWidget(self.btn_skip_start)
+        layout.addWidget(self.btn_step_back)
+        layout.addWidget(self.btn_play)
+        layout.addWidget(self.btn_step_fwd)
+        layout.addWidget(self.btn_skip_end)
+        layout.addWidget(self.slider, 1)
+
+        # Wire internal handlers
+        self.btn_play.clicked.connect(self._on_play_clicked)
+        self.btn_skip_start.clicked.connect(self.skipToStart)
+        self.btn_skip_end.clicked.connect(self.skipToEnd)
+        self.btn_step_back.clicked.connect(lambda: self.stepRequested.emit(-1))
+        self.btn_step_fwd.clicked.connect(lambda: self.stepRequested.emit(1))
+        self.slider.valueChanged.connect(self._on_slider_changed)
+
+    # ── Public API for MainWindow ───────────────────────────────────
+
+    def set_total_samples(self, n):
+        n = max(0, min(SHOT_PHASE_TOTAL, int(n)))
+        self._total = n
+        self.slider.setRange(0, n)
+        self.reset()
+
+    def set_position(self, value):
+        value = max(0, min(self._total, int(value)))
+        self._position = value
+        self.slider.blockSignals(True)
+        self.slider.setValue(value)
+        self.slider.blockSignals(False)
+
+    def set_playing(self, playing):
+        self._playing = bool(playing)
+        self.btn_play.setText("⏸" if self._playing else "▶")
+
+    def reset(self):
+        self.stop_timer()
+        self.set_position(0)
+        self.set_playing(False)
+
+    def stop_timer(self):
+        if self._timer.isActive():
+            self._timer.stop()
+        self._playing = False
+        self.btn_play.setText("▶")
+
+    # ── Internal handlers ───────────────────────────────────────────
+
+    def _on_play_clicked(self):
+        if self._position >= self._total and self._total > 0:
+            self.set_position(0)
+        self.playToggled.emit()
+
+    def _on_slider_changed(self, value):
+        self._position = value
+        self.scrubRequested.emit(value)
+
+    def _on_tick(self):
+        if self._position >= self._total:
+            self._timer.stop()
+            self._playing = False
+            self.btn_play.setText("▶")
+            return
+        self.stepRequested.emit(1)
 
 
 class SparklineWidget(QWidget):
@@ -1717,172 +2051,146 @@ class SparklineWidget(QWidget):
             painter.drawEllipse(int(x) - 3, int(y) - 3, 6, 6)
 
 
-class PerShotStatsWidget(QWidget):
-    def __init__(self, parent=None):
+class ShotChip(QPushButton):
+    """Clickable circular shot indicator. Uses QPushButton for bulletproof
+    click handling that survives nested containers in fullscreen mode."""
+
+    def __init__(self, shot: dict, display_number: int, parent: QWidget | None = None):
         super().__init__(parent)
-        self._setup_ui()
+        self._shot = shot
+        self._selected = False
+        self.setFixedSize(40, 40)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setText(str(display_number))
+        self.setFocusPolicy(Qt.NoFocus)
+        score = shot.get('score', 0) or 0
+        self.setToolTip(f"Shot {display_number} · Score: {int(score)}")
+        self._apply_style()
 
-    def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-
-        self._title = QLabel("Per-Shot Statistics")
-        self._title.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 14px; font-weight: 600;")
-        layout.addWidget(self._title)
-
-        self._phase_bars = {}
-        for phase, color in [('Hold', '#FF0000'),
-                              ('Press', '#FFFF00'),
-                              ('Recoil', '#00FFFF'),
-                              ('FT', '#FF5252')]:
-            row = QHBoxLayout()
-            row.setSpacing(8)
-            lbl = QLabel(phase)
-            lbl.setFixedWidth(46)
-            lbl.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; font-weight: 600;")
-            row.addWidget(lbl)
-
-            bar = QProgressBar()
-            bar.setFixedHeight(8)
-            bar.setTextVisible(False)
-            bar.setStyleSheet(f"""
-                QProgressBar {{
-                    background: {COLORS['bg_tertiary']};
-                    border: none;
-                    border-radius: 4px;
-                }}
-                QProgressBar::chunk {{
-                    background: {color};
-                    border-radius: 4px;
+    def _apply_style(self):
+        if self._selected:
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS.get('accent_good', '#00D26A')};
+                    color: #1a1a1a;
+                    border: 2px solid {COLORS.get('accent_good', '#00D26A')};
+                    border-radius: 20px;
+                    font-size: 14px;
+                    font-weight: 700;
+                    padding: 0px;
+                    margin: 0px;
                 }}
             """)
-            self._phase_bars[phase] = bar
-            row.addWidget(bar, 1)
-
-            self._phase_bars[f'{phase}_lbl'] = QLabel("--")
-            self._phase_bars[f'{phase}_lbl'].setFixedWidth(28)
-            self._phase_bars[f'{phase}_lbl'].setStyleSheet(f"color: {color}; font-size: 11px; font-weight: 700;")
-            row.addWidget(self._phase_bars[f'{phase}_lbl'])
-            layout.addLayout(row)
-
-        layout.addSpacing(4)
-
-        self._a2c_lbl = QLabel("A2C: --")
-        self._a2c_lbl.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
-        layout.addWidget(self._a2c_lbl)
-
-        self._stab_lbl = QLabel("Stability: --")
-        self._stab_lbl.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
-        self._shoot_lbl = QLabel("Shooting: --")
-        self._shoot_lbl.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
-        score_row = QHBoxLayout()
-        score_row.addWidget(self._stab_lbl)
-        score_row.addWidget(self._shoot_lbl)
-        layout.addLayout(score_row)
-
-        self._grade_lbl = QLabel("Grade: --")
-        self._grade_lbl.setStyleSheet(
-            f"background: {COLORS['bg_tertiary']}; border: 1px solid {COLORS['border']}; "
-            f"border-radius: 8px; padding: 6px 14px; "
-            f"font-size: 12px; font-weight: 700; color: {COLORS['text_secondary']};")
-        layout.addWidget(self._grade_lbl)
-
-        self._err_lbl = QLabel("Error: --")
-        self._err_lbl.setStyleSheet(
-            f"background: {COLORS['accent_ok']}22; border: 1px solid {COLORS['accent_ok']}66; "
-            f"border-radius: 6px; padding: 4px 10px; "
-            f"font-size: 11px; color: {COLORS['accent_ok']};")
-        self._err_lbl.setVisible(False)
-        layout.addWidget(self._err_lbl)
-
-        self._imp_lbl = QLabel("Impact: (--, --)")
-        self._imp_lbl.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px;")
-        layout.addWidget(self._imp_lbl)
-
-        self._issf_score_lbl = QLabel("ISSF: --")
-        self._issf_score_lbl.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px; font-weight: 600;")
-        layout.addWidget(self._issf_score_lbl)
-
-        layout.addStretch()
-
-    def populate(self, shot):
-        for phase, key in [('Hold', 'hold_score'),
-                           ('Press', 'press_score'),
-                           ('Recoil', 'recoil_score'),
-                           ('FT', 'ft_score')]:
-            score = shot.get(key, 0) or 0
-            self._phase_bars[phase].setValue(int(score))
-            self._phase_bars[f'{phase}_lbl'].setText(f"{int(score)}")
-
-        a2c_angle = shot.get('a2c_angle', 0) or 0
-        a2c_mag = shot.get('a2c_mag', 0) or 0
-        self._a2c_lbl.setText(f"A2C: {a2c_angle:+.1f}° / {a2c_mag:.1f}mrad")
-
-        stab = shot.get('score', 0) or 0
-        self._stab_lbl.setText(f"Stability: {int(stab)}")
-        self._shoot_lbl.setText(f"Shooting: {int(stab)}")
-
-        score_val = shot.get('score', 0) or 0
-        grade_color = self._score_color(score_val)
-        grade = self._letter_grade(score_val)
-        self._grade_lbl.setText(f"Grade: {grade}")
-        self._grade_lbl.setStyleSheet(
-            f"background: {grade_color}33; border: 1px solid {grade_color}88; "
-            f"border-radius: 8px; padding: 6px 14px; "
-            f"font-size: 12px; font-weight: 700; color: {grade_color};")
-
-        err = shot.get('error_type', '') or ''
-        if err and err not in ('NONE', 'none', ''):
-            self._err_lbl.setText(f"Error: {err}")
-            self._err_lbl.setVisible(True)
         else:
-            self._err_lbl.setVisible(False)
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS.get('bg_tertiary', '#2a2a2a')};
+                    color: {COLORS.get('text_primary', '#ffffff')};
+                    border: 2px solid {COLORS.get('border', '#3a3a3a')};
+                    border-radius: 20px;
+                    font-size: 14px;
+                    font-weight: 600;
+                    padding: 0px;
+                    margin: 0px;
+                }}
+                QPushButton:hover {{
+                    background: {COLORS.get('border', '#4a4a4a')};
+                    border: 2px solid {COLORS.get('accent_good', '#00D26A')};
+                }}
+                QPushButton:pressed {{
+                    background: {COLORS.get('accent_good', '#00D26A')};
+                    color: #1a1a1a;
+                }}
+            """)
 
-        ix = shot.get('impact_x_cm', 0) or 0
-        iy = shot.get('impact_y_cm', 0) or 0
-        self._imp_lbl.setText(f"Impact: ({ix:+.1f}, {iy:+.1f}) cm")
+    def set_selected(self, selected: bool) -> None:
+        if self._selected != selected:
+            self._selected = selected
+            self._apply_style()
 
-        # NEW: Calculate and display ISSF score
-        target_spec = TARGET_SPECS.get('10m_air_pistol', TARGET_SPECS['10m_air_pistol'])
-        issf_score, ring = calculate_issf_score(ix, iy, target_spec)
-        self._issf_score_lbl.setText(f"ISSF: {issf_score:.1f} (Ring {ring})")
+    @property
+    def shot(self) -> dict:
+        return self._shot
 
-    def _score_color(self, score):
-        if score >= 95: return COLORS.get('score_elite', COLORS['accent_good'])
-        if score >= 85: return COLORS.get('score_expert', COLORS['accent_good'])
-        if score >= 70: return COLORS.get('score_advanced', COLORS['accent_ok'])
-        if score >= 50: return COLORS.get('score_intermediate', COLORS['accent_ok'])
-        return COLORS.get('score_beginner', COLORS['accent_bad'])
 
-    def _letter_grade(self, score):
-        if score >= 97: return 'A+'
-        if score >= 93: return 'A'
-        if score >= 90: return 'A-'
-        if score >= 87: return 'B+'
-        if score >= 83: return 'B'
-        if score >= 80: return 'B-'
-        if score >= 77: return 'C+'
-        if score >= 73: return 'C'
-        if score >= 70: return 'C-'
-        if score >= 60: return 'D'
-        return 'F'
+class ShotFilmStrip(QWidget):
+    """Horizontal scrollable filmstrip of ShotChip widgets."""
 
-    def clear(self):
-        for phase in ['Hold', 'Press', 'Recoil', 'FT']:
-            self._phase_bars[phase].setValue(0)
-            self._phase_bars[f'{phase}_lbl'].setText("--")
-        self._a2c_lbl.setText("A2C: --")
-        self._stab_lbl.setText("Stability: --")
-        self._shoot_lbl.setText("Shooting: --")
-        self._grade_lbl.setText("Grade: --")
-        self._grade_lbl.setStyleSheet(
-            f"background: {COLORS['bg_tertiary']}; border: 1px solid {COLORS['border']}; "
-            f"border-radius: 8px; padding: 6px 14px; "
-            f"font-size: 12px; font-weight: 700; color: {COLORS['text_secondary']};")
-        self._err_lbl.setVisible(False)
-        self._imp_lbl.setText("Impact: (--, --)")
-        self._issf_score_lbl.setText("ISSF: --")  # NEW: Clear ISSF label
+    shot_selected = pyqtSignal(dict)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._chips: list[ShotChip] = []
+        self._selected_chip: ShotChip | None = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll_area.setStyleSheet(f"""
+            QScrollArea {{ border: none; background: transparent; }}
+            QScrollBar:horizontal {{ background: {COLORS['bg_tertiary']}; height: 4px; border-radius: 2px; }}
+            QScrollBar::handle:horizontal {{ background: {COLORS['border']}; border-radius: 2px; min-width: 20px; }}
+        """)
+        outer.addWidget(self._scroll_area)
+
+        self._scroll_contents = QWidget()
+        self._scroll_layout = QHBoxLayout(self._scroll_contents)
+        self._scroll_layout.setContentsMargins(8, 8, 8, 8)
+        self._scroll_layout.setSpacing(8)
+        self._scroll_layout.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self._scroll_layout.addStretch(1)
+        self._scroll_area.setWidget(self._scroll_contents)
+
+    def update_shots(self, shots: list[dict]) -> None:
+        for chip in self._chips:
+            chip.setParent(None)
+            chip.deleteLater()
+        self._chips.clear()
+        self._selected_chip = None
+
+        for i in reversed(range(self._scroll_layout.count())):
+            item = self._scroll_layout.itemAt(i)
+            if item and item.spacerItem():
+                self._scroll_layout.removeItem(item)
+
+        for idx, shot in enumerate(shots, start=1):
+            chip = ShotChip(shot, idx)
+            self._chips.append(chip)
+            chip.set_selected(False)
+            # QPushButton.clicked emits a checked-bool positional arg, which
+            # would shadow the default-arg `s=shot` and corrupt it to `True`.
+            # Accept and discard that arg so `s` keeps the captured shot dict.
+            chip.clicked.connect(lambda _checked, s=shot, n=idx: self._on_chip_clicked(s, n))
+            self._scroll_layout.addWidget(chip)
+
+        self._scroll_layout.addStretch(1)
+        if shots:
+            QTimer.singleShot(0, self._scroll_to_end)
+
+    def _scroll_to_end(self) -> None:
+        hbar = self._scroll_area.horizontalScrollBar()
+        if hbar:
+            hbar.setValue(hbar.maximum())
+
+    def _on_chip_clicked(self, shot: dict, display_number: int) -> None:
+        self.shot_selected.emit({**shot, 'shot_number': display_number})
+
+    def _emit_shot(self, shot: dict) -> None:
+        self.shot_selected.emit(shot)
+
+    def select_shot(self, shot_number: int) -> None:
+        for chip in self._chips:
+            if chip.text() == str(shot_number):
+                if self._selected_chip is not None:
+                    self._selected_chip.set_selected(False)
+                chip.set_selected(True)
+                self._selected_chip = chip
+                break
 
 
 class SessionStatsWidget(QWidget):
@@ -1944,9 +2252,9 @@ class SessionStatsWidget(QWidget):
 
     def populate(self, shots):
         if not shots:
-            self._avg_card.findChild(QLabel, "", Qt.FindDirectChildOnly).setText("--")
-            self._best_card.findChild(QLabel, "", Qt.FindDirectChildOnly).setText("--")
-            self._count_card.findChild(QLabel, "", Qt.FindDirectChildOnly).setText("0")
+            self._set_card_value(self._avg_card, "--")
+            self._set_card_value(self._best_card, "--")
+            self._set_card_value(self._count_card, "0")
             self._sparkline.set_values([])
             return
 
@@ -2037,6 +2345,7 @@ class MainWindow(QMainWindow):
         self.detector    = ShotDetector()
         self.session_id  = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.live_window = None
+        self.shot_history = []
         self.init_ui()
         self.calib_buffer = []
         self.calibrating  = False
@@ -2084,7 +2393,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle('STASYS')
         self.setMinimumSize(1024, 768)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.showFullScreen()
+        self.showMaximized()
 
         palette = QPalette()
         palette.setColor(QPalette.Window, QColor(COLORS['bg_primary']))
@@ -2467,13 +2776,86 @@ class MainWindow(QMainWindow):
     def _build_shot_analysis_tab(self):
         tab2 = QWidget()
         tab2.setStyleSheet(f"background: {COLORS['bg_primary']};")
-        tab2_layout = QHBoxLayout(tab2)
+        tab2_layout = QVBoxLayout(tab2)
         tab2_layout.setContentsMargins(20, 20, 20, 20)
-        tab2_layout.setSpacing(20)
+        tab2_layout.setSpacing(12)
 
+        # ---- Top bar: session dropdown + two big score readouts ----
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(16)
+
+        self._session_combo = QComboBox()
+        self._session_combo.setMinimumWidth(220)
+        self._session_combo.setCursor(Qt.PointingHandCursor)
+        self._session_combo.currentIndexChanged.connect(self._on_session_filter_changed)
+        self._session_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+                padding: 6px 12px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QComboBox:hover {{ border: 1px solid {COLORS.get('accent_good', '#00D26A')}; }}
+            QComboBox::drop-down {{ border: none; width: 24px; }}
+        """)
+        top_bar.addWidget(self._session_combo)
+
+        top_bar.addSpacing(12)
+
+        # Stability score readout
+        stab_box = QFrame()
+        stab_box.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['bg_tertiary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px;
+            }}
+        """)
+        stab_box_layout = QHBoxLayout(stab_box)
+        stab_box_layout.setContentsMargins(14, 6, 14, 6)
+        stab_box_layout.setSpacing(8)
+        stab_lbl = QLabel("STABILITY")
+        stab_lbl.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px; font-weight: 700; letter-spacing: 1px;")
+        stab_box_layout.addWidget(stab_lbl)
+        self._sa_stability_score = QLabel("--")
+        self._sa_stability_score.setStyleSheet(f"font-size: 28px; font-weight: 200; color: {COLORS['text_muted']};")
+        stab_box_layout.addWidget(self._sa_stability_score)
+        top_bar.addWidget(stab_box)
+
+        # Shooting score readout
+        shoot_box = QFrame()
+        shoot_box.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['bg_tertiary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px;
+            }}
+        """)
+        shoot_box_layout = QHBoxLayout(shoot_box)
+        shoot_box_layout.setContentsMargins(14, 6, 14, 6)
+        shoot_box_layout.setSpacing(8)
+        shoot_lbl = QLabel("SHOOTING")
+        shoot_lbl.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 10px; font-weight: 700; letter-spacing: 1px;")
+        shoot_box_layout.addWidget(shoot_lbl)
+        self._sa_shooting_score = QLabel("--")
+        self._sa_shooting_score.setStyleSheet(f"font-size: 28px; font-weight: 200; color: {COLORS['text_muted']};")
+        shoot_box_layout.addWidget(self._sa_shooting_score)
+        top_bar.addWidget(shoot_box)
+
+        top_bar.addStretch()
+        self._sa_shot_indicator = QLabel("No shot selected")
+        self._sa_shot_indicator.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 12px; font-weight: 600;")
+        top_bar.addWidget(self._sa_shot_indicator)
+
+        tab2_layout.addLayout(top_bar)
+
+        # ---- Center: trace canvas + session stats (horizontal split) ----
         splitter = QSplitter(Qt.Horizontal)
 
-        # Left: Shot trace canvas
+        # Left of center: trace + legend + replay
         trace_panel = QVBoxLayout()
         self.shot_trace_canvas = ShotTraceCanvas()
         self.shot_trace_canvas.setStyleSheet(f"""
@@ -2483,10 +2865,11 @@ class MainWindow(QMainWindow):
         """)
         trace_panel.addWidget(self.shot_trace_canvas, 1)
 
-        # Legend row
         legend_row = QHBoxLayout()
         legend_row.setSpacing(16)
-        for color, label in [('#FF0000', 'Hold'), ('#FFFF00', 'Press'), ('#00FFFF', 'FT')]:
+        for color, label in [(ShotTraceCanvas.COL_HOLD, 'Hold'),
+                             (ShotTraceCanvas.COL_PRESS, 'Press'),
+                             (ShotTraceCanvas.COL_RECOIL, 'FT')]:
             dot = QFrame()
             dot.setFixedSize(12, 12)
             dot.setStyleSheet(f"background: {color}; border-radius: 6px;")
@@ -2500,33 +2883,154 @@ class MainWindow(QMainWindow):
         legend_row.addWidget(hint)
         trace_panel.addLayout(legend_row)
 
+        self.replay_bar = ReplayBar()
+        self.replay_bar.hide()
+        self.replay_bar.playToggled.connect(self._on_replay_play_toggled)
+        self.replay_bar.skipToStart.connect(self._on_replay_skip_start)
+        self.replay_bar.skipToEnd.connect(self._on_replay_skip_end)
+        self.replay_bar.stepRequested.connect(self._on_replay_step)
+        self.replay_bar.scrubRequested.connect(self._on_replay_scrub)
+        trace_panel.addWidget(self.replay_bar)
+
         trace_frame = QFrame()
         trace_frame.setLayout(trace_panel)
         trace_frame.setStyleSheet(f"background: {COLORS['bg_secondary']}; border-radius: 16px; padding: 12px;")
         splitter.addWidget(trace_frame)
 
-        # Right: Stats
+        # Right of center: session stats only (per-shot stats removed)
         right_panel = QVBoxLayout()
         right_panel.setSpacing(12)
-
-        self.per_shot_stats = PerShotStatsWidget()
-        stats_card = self._card(self.per_shot_stats)
-        right_panel.addWidget(stats_card)
-
         self.session_stats = SessionStatsWidget()
         session_card = self._card(self.session_stats)
         right_panel.addWidget(session_card)
-
         right_panel.addStretch()
         right_frame = QFrame()
         right_frame.setLayout(right_panel)
         splitter.addWidget(right_frame)
 
-        splitter.setStretchFactor(0, 6)
-        splitter.setStretchFactor(1, 4)
-        splitter.setHandleWidth(8)
-        tab2_layout.addWidget(splitter)
+        splitter.setStretchFactor(0, 7)
+        splitter.setStretchFactor(1, 3)
+        splitter.setHandleWidth(1)
+        tab2_layout.addWidget(splitter, 1)
+
+        # ---- Bottom: filmstrip of shot chips for the selected session ----
+        self.shot_filmstrip = ShotFilmStrip()
+        self.shot_filmstrip.setFixedHeight(60)
+        self.shot_filmstrip.shot_selected.connect(self._on_filmstrip_shot_selected)
+
+        filmstrip_card = QFrame()
+        filmstrip_card.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['bg_card']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
+            }}
+        """)
+        filmstrip_layout = QVBoxLayout(filmstrip_card)
+        filmstrip_layout.setContentsMargins(8, 6, 8, 6)
+        filmstrip_layout.setSpacing(0)
+        filmstrip_layout.addWidget(self.shot_filmstrip)
+        tab2_layout.addWidget(filmstrip_card)
+
         self.tabs.addTab(tab2, "Shot Analysis")
+
+        self._populate_session_combo()
+        self._on_session_filter_changed(0)
+
+    def _populate_session_combo(self):
+        """Load all sessions from DB into the dropdown filter."""
+        if not hasattr(self, '_session_combo'):
+            return
+        prev = self._session_combo.currentData()
+        self._session_combo.blockSignals(True)
+        self._session_combo.clear()
+        self._session_combo.addItem("Current Session", None)
+        try:
+            sessions = get_all_sessions()
+        except Exception:
+            sessions = []
+        for s in sessions:
+            start = s['start_time'] if isinstance(s, sqlite3.Row) else s[1]
+            count = s['shot_count'] if isinstance(s, sqlite3.Row) else s[4]
+            sid = s['session_id'] if isinstance(s, sqlite3.Row) else s[0]
+            try:
+                start_str = datetime.fromisoformat(str(start)).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                start_str = str(start)
+            label = f"{start_str} · {count} shots"
+            self._session_combo.addItem(label, sid)
+        if prev is not None:
+            idx = self._session_combo.findData(prev)
+            if idx >= 0:
+                self._session_combo.setCurrentIndex(idx)
+        self._session_combo.blockSignals(False)
+
+    def _on_session_filter_changed(self, _idx):
+        """Filter filmstrip to shots from the selected session."""
+        if not hasattr(self, '_session_combo'):
+            return
+        sid = self._session_combo.currentData()
+        if sid is None:
+            shots = list(self.shot_history) if hasattr(self, 'shot_history') else []
+        else:
+            try:
+                shots = get_session_shots(sid)
+            except Exception:
+                shots = []
+        self.shot_filmstrip.update_shots(shots)
+        self.session_stats.populate(shots)
+        if shots:
+            self._load_filmstrip_shot(shots[-1])
+        else:
+            self._sa_stability_score.setText("--")
+            self._sa_stability_score.setStyleSheet(f"font-size: 28px; font-weight: 200; color: {COLORS['text_muted']};")
+            self._sa_shooting_score.setText("--")
+            self._sa_shooting_score.setStyleSheet(f"font-size: 28px; font-weight: 200; color: {COLORS['text_muted']};")
+            self._sa_shot_indicator.setText("No shot selected")
+            self.shot_trace_canvas.clear_trace()
+
+    def _on_filmstrip_shot_selected(self, shot: dict):
+        self._load_filmstrip_shot(shot)
+
+    def _load_filmstrip_shot(self, shot: dict):
+        self._update_sa_shot_score(shot)
+        aim_trace = shot.get('aim_trace')
+        if aim_trace:
+            self.shot_trace_canvas.set_trace(
+                hold=aim_trace.get('hold'),
+                press=aim_trace.get('press'),
+                recoil=aim_trace.get('recoil'),
+                score=shot.get('score', 0),
+                impact_x_cm=shot.get('impact_x_cm', 0.0),
+                impact_y_cm=shot.get('impact_y_cm', 0.0),
+                shot_idx=shot.get('shot_number', 0),
+            )
+            self._load_shot_into_replay(shot)
+        if hasattr(self.shot_filmstrip, 'select_shot'):
+            self.shot_filmstrip.select_shot(shot.get('shot_number', 0))
+
+    def _update_sa_shot_score(self, shot: dict):
+        """Update the two big score labels at the top of the Shot Analysis tab."""
+        score_val = shot.get('score', 0) or 0
+        muted = f"font-size: 28px; font-weight: 200; color: {COLORS['text_muted']};"
+        active = f"font-size: 28px; font-weight: 200; color: {COLORS['text_primary']};"
+        if score_val <= 0:
+            self._sa_stability_score.setText("--")
+            self._sa_stability_score.setStyleSheet(muted)
+            self._sa_shooting_score.setText("--")
+            self._sa_shooting_score.setStyleSheet(muted)
+            self._sa_shot_indicator.setText("No shot selected")
+            return
+        self._sa_stability_score.setText(f"{int(score_val)}")
+        self._sa_stability_score.setStyleSheet(active)
+        self._sa_shooting_score.setText(f"{int(score_val)}")
+        self._sa_shooting_score.setStyleSheet(active)
+        shot_num = shot.get('shot_number', '?')
+        if hasattr(self, '_session_combo') and self._session_combo.currentData() is None:
+            label = f"Shot {shot_num} of current session"
+        else:
+            label = f"Shot {shot_num} (past session)"
+        self._sa_shot_indicator.setText(label)
 
     def _build_history_tab(self):
         tab3 = QWidget()
@@ -2682,6 +3186,57 @@ class MainWindow(QMainWindow):
         tab4_layout.addWidget(target_section)
         tab4_layout.addSpacing(16)
 
+        # ── Stability Settings Section ──────────────────────────────────────
+        stability_section = QFrame()
+        stability_section.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['bg_secondary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
+                padding: 16px;
+            }}
+        """)
+        stability_layout = QVBoxLayout(stability_section)
+
+        stability_title = QLabel("Stability Settings")
+        stability_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        stability_title.setStyleSheet(f"color: {COLORS['accent_good']};")
+        stability_layout.addWidget(stability_title)
+
+        # Max Rotation for Trigger
+        rot_row = QHBoxLayout()
+        rot_lbl = QLabel("Max Rotation for Trigger (rad/s):")
+        rot_lbl.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 13px;")
+        rot_lbl.setFixedWidth(220)
+        rot_row.addWidget(rot_lbl)
+
+        self.spin_rotation_limit = QDoubleSpinBox()
+        self.spin_rotation_limit.setRange(1.0, 20.0)
+        self.spin_rotation_limit.setSingleStep(0.5)
+        self.spin_rotation_limit.setValue(DEFAULT_SHOT_ROTATION_LIMIT)
+        self.spin_rotation_limit.setFont(QFont("Segoe UI", 13))
+        self.spin_rotation_limit.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                border: 2px solid {COLORS['border']};
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 13px;
+            }}
+        """)
+        self.spin_rotation_limit.valueChanged.connect(self.change_rotation_limit)
+        rot_row.addWidget(self.spin_rotation_limit, 1)
+        stability_layout.addLayout(rot_row)
+
+        rot_hint = QLabel("Shots won't trigger while rotation exceeds this value. Requires 100ms of stability.")
+        rot_hint.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px;")
+        rot_hint.setWordWrap(True)
+        stability_layout.addWidget(rot_hint)
+
+        tab4_layout.addWidget(stability_section)
+        tab4_layout.addSpacing(16)
+
         # COM Port
         port_label = QLabel("COM Port")
         port_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; text-transform: uppercase; letter-spacing: 1px;")
@@ -2743,7 +3298,88 @@ class MainWindow(QMainWindow):
         return card
 
     def _on_history_item_clicked(self, item):
-        pass  # TODO: populate shot analysis tab with selected shot
+        """Load selected historical shot into trace canvas and replay bar."""
+        if not hasattr(self, 'list_history') or self.list_history is None:
+            return
+        idx = self.list_history.row(item)
+        if not hasattr(self, 'shot_history') or not (0 <= idx < len(self.shot_history)):
+            return
+        shot = self.shot_history[idx]
+
+        aim_trace = shot.get('aim_trace')
+        if not aim_trace:
+            return
+
+        # aim_trace is JSON-loaded: {"hold": ([x...], [y...]), "press": ..., "recoil": ...}
+        self.shot_trace_canvas.set_trace(
+            hold=aim_trace.get('hold'),
+            press=aim_trace.get('press'),
+            recoil=aim_trace.get('recoil'),
+            score=shot.get('score', 0),
+            impact_x_cm=shot.get('impact_x_cm', 0.0),
+            impact_y_cm=shot.get('impact_y_cm', 0.0),
+            shot_idx=shot.get('shot_number', idx + 1),
+        )
+        self._update_sa_shot_score(shot)
+        self._load_shot_into_replay(shot)
+        if hasattr(self, 'shot_filmstrip'):
+            self.shot_filmstrip.select_shot(shot.get('shot_number', idx + 1))
+
+    def _load_shot_into_replay(self, shot):
+        """Reset replay state for the newly selected shot."""
+        if not hasattr(self, 'replay_bar') or not hasattr(self, 'shot_trace_canvas'):
+            return
+        self.replay_bar.stop_timer()
+        self.shot_trace_canvas.playback_pos = 0
+        self.shot_trace_canvas.replay_mode = True
+        self.replay_bar.set_total_samples(SHOT_PHASE_TOTAL)
+        self.replay_bar.reset()
+        self.replay_bar.show()
+        self.replay_bar.setEnabled(True)
+
+    def _on_replay_play_toggled(self):
+        if not hasattr(self, 'replay_bar') or not hasattr(self, 'shot_trace_canvas'):
+            return
+        if self.replay_bar._timer.isActive():
+            self.replay_bar.stop_timer()
+        else:
+            self.replay_bar._timer.start(10)
+            self.replay_bar._playing = True
+            self.replay_bar.set_playing(True)
+
+    def _on_replay_skip_start(self):
+        if not hasattr(self, 'shot_trace_canvas') or not hasattr(self, 'replay_bar'):
+            return
+        self.shot_trace_canvas.playback_pos = 0
+        self.replay_bar.set_position(0)
+        self.replay_bar.stop_timer()
+        self.shot_trace_canvas.update()
+
+    def _on_replay_skip_end(self):
+        if not hasattr(self, 'shot_trace_canvas') or not hasattr(self, 'replay_bar'):
+            return
+        self.shot_trace_canvas.playback_pos = self.shot_trace_canvas._total
+        self.replay_bar.set_position(self.shot_trace_canvas._total)
+        self.replay_bar.stop_timer()
+        self.shot_trace_canvas.update()
+
+    def _on_replay_step(self, delta):
+        if not hasattr(self, 'shot_trace_canvas') or not hasattr(self, 'replay_bar'):
+            return
+        new_pos = self.shot_trace_canvas.playback_pos + delta
+        new_pos = max(0, min(self.shot_trace_canvas._total, new_pos))
+        self.shot_trace_canvas.playback_pos = new_pos
+        self.replay_bar.set_position(new_pos)
+        self.shot_trace_canvas.update()
+
+    def _on_replay_scrub(self, value):
+        if not hasattr(self, 'shot_trace_canvas') or not hasattr(self, 'replay_bar'):
+            return
+        value = max(0, min(self.shot_trace_canvas._total, int(value)))
+        self.shot_trace_canvas.playback_pos = value
+        if self.replay_bar._timer.isActive():
+            self.replay_bar.stop_timer()
+        self.shot_trace_canvas.update()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
@@ -2796,6 +3432,14 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'shot_trace_canvas'):
             self.shot_trace_canvas.set_issf_mode(issf_enabled)
 
+    def change_rotation_limit(self):
+        """Handle shot rotation limit spinbox change."""
+        value = self.spin_rotation_limit.value()
+        self.detector.rotation_limit = value
+        settings = load_settings()
+        settings['shot_rotation_limit'] = value
+        save_settings(settings)
+
     def update_thresholds(self):
         self.detector.accel_thresh = self.spin_jerk.value()
         self.detector.piezo_thresh = self.spin_piezo.value()
@@ -2814,6 +3458,12 @@ class MainWindow(QMainWindow):
         view_mode = settings.get('target_view_mode', 'issf')
         view_index = 0 if view_mode == 'issf' else 1
         self.cmb_view_mode.setCurrentIndex(view_index)
+
+        # Load shot rotation limit
+        rotation_limit = settings.get('shot_rotation_limit', DEFAULT_SHOT_ROTATION_LIMIT)
+        if hasattr(self, 'spin_rotation_limit'):
+            self.spin_rotation_limit.setValue(rotation_limit)
+        self.detector.rotation_limit = rotation_limit
 
         # Apply settings to canvas
         if hasattr(self, 'shot_trace_canvas'):
@@ -2847,10 +3497,14 @@ class MainWindow(QMainWindow):
 
     def reset_session(self):
         self.list_history.clear()
+        self.shot_history = []
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.shot_trace_canvas.clear_trace()
-        self.per_shot_stats.clear()
         self.session_stats.clear()
+        self._sa_stability_score.setText("--")
+        self._sa_stability_score.setStyleSheet(f"font-size: 28px; font-weight: 200; color: {COLORS['text_muted']};")
+        self._sa_shooting_score.setText("--")
+        self._sa_shooting_score.setStyleSheet(f"font-size: 28px; font-weight: 200; color: {COLORS['text_muted']};")
         self.lbl_stability_score.setText("--")
         self.lbl_stability_score.setStyleSheet(f"font-size: 42px; font-weight: 200; color: {COLORS['text_muted']};")
         self.lbl_stability_grade.setText("")
@@ -2858,6 +3512,11 @@ class MainWindow(QMainWindow):
         self.lbl_shooting_score.setStyleSheet(f"font-size: 42px; font-weight: 200; color: {COLORS['text_muted']};")
         self.lbl_shooting_grade.setText("")
         self.lbl_shot_count.setText("Shots: 0")
+
+        # Clear shot analysis filmstrip and reload sessions
+        if hasattr(self, 'shot_filmstrip'):
+            self.shot_filmstrip.update_shots([])
+        self._populate_session_combo()
 
     def toggle_recording(self):
         pass  # TODO: implement recording toggle
@@ -2986,6 +3645,7 @@ class MainWindow(QMainWindow):
                     impact_y_cm=shot_res.get('impact_y_cm', 0),
                     shot_idx=len(self.list_history) + 1,
                 )
+                self._load_shot_into_replay(shot_res)
 
                 # Add impact point to canvas
                 if self.shot_trace_canvas:
@@ -2999,19 +3659,36 @@ class MainWindow(QMainWindow):
                     # Add impact point to canvas
                     self.shot_trace_canvas.add_impact_point(ix, iy, issf_score)
 
-                # Per-shot stats
-                self.per_shot_stats.populate(shot_res)
+                # Update shot analysis scores
+                self._update_sa_shot_score(shot_res)
 
                 # History list
                 self.list_history.insertItem(
                     0, f"{datetime.now().strftime('%H:%M:%S')} "
                        f"- Score: {score:.1f} (Pz:{piezo_val})")
 
+                # Save shot dict for replay from history tab
+                self.shot_history.append(shot_res)
+
+                # Update shot analysis filmstrip if viewing current session
+                if getattr(self, '_session_combo', None) is not None and self._session_combo.currentData() is None:
+                    self.shot_filmstrip.update_shots(list(self.shot_history))
+
                 # Shot count
                 shot_count = self.list_history.count()
                 self.lbl_shot_count.setText(f"Shots: {shot_count}")
 
-                log_shot_db(self.session_id, score, 0.0, "Auto")
+                log_shot_trace(self.session_id, len(self.list_history),
+                               score, piezo_val, shot_res.get('aim_trace', {}),
+                               mode=self.detector.trigger_mode,
+                               grade=grade,
+                               hold_score=shot_res.get('hold_score', 0),
+                               press_score=shot_res.get('press_score', 0),
+                               recoil_score=shot_res.get('recoil_score', 0),
+                               ft_score=shot_res.get('ft_score', 0),
+                               error_type=shot_res.get('error_type', 'NONE'),
+                               impact_x_cm=shot_res.get('impact_x_cm', 0),
+                               impact_y_cm=shot_res.get('impact_y_cm', 0))
 
 
 # ================= ENTRY POINT =================
@@ -3020,50 +3697,49 @@ if __name__ == '__main__':
     setup_database()
     app = QApplication(sys.argv)
 
-    logger.info("Attempting connection to %s...", BLUETOOTH_COM_PORT)
-
-    # Windows Bluetooth SPP ports (especially on reconnect) often raise
-    # OSError 121 "semaphore timeout" because the RF link isn't fully
-    # established yet even though the COM port is registered.
-    # Fix: retry opening the port up to MAX_SERIAL_RETRIES times.
-    MAX_SERIAL_RETRIES = 10
-    SERIAL_RETRY_DELAY = 2.0   # seconds between retries
-
     ser = None
-    for attempt in range(1, MAX_SERIAL_RETRIES + 1):
-        try:
-            logger.info("Serial open attempt %d/%d on %s...",
-                        attempt, MAX_SERIAL_RETRIES, BLUETOOTH_COM_PORT)
-            ser = serial.Serial(BLUETOOTH_COM_PORT, BAUD_RATE, timeout=0.5)
-            logger.info("Port opened successfully.")
-            break
-        except OSError as e:
-            # Error 121 = semaphore timeout (BT link not ready yet)
-            # Error   2 = port not found (device not paired/connected)
-            logger.warning("Open failed (attempt %d): %s", attempt, e)
-            if attempt < MAX_SERIAL_RETRIES:
-                logger.info("Retrying in %.0fs — make sure ESP32 is on and paired...",
-                            SERIAL_RETRY_DELAY)
-                time.sleep(SERIAL_RETRY_DELAY)
-        except Exception as e:
-            logger.warning("Unexpected error opening port: %s", e)
-            break
+
+    # Auto-discover STASYS device on any COM port
+    logger.info("Scanning for STASYS devices...")
+    discovered = discover_stasys_devices()
+
+    if discovered:
+        ser, desc = discovered[0]
+        logger.info("Connected to STASYS on %s — %s", ser.port, desc)
+        # Auth already completed inside discover_stasys_devices
+    else:
+        # Fallback: try hardcoded port
+        logger.info("No device found — falling back to %s...", BLUETOOTH_COM_PORT)
+        MAX_SERIAL_RETRIES = 10
+        SERIAL_RETRY_DELAY = 2.0
+        for attempt in range(1, MAX_SERIAL_RETRIES + 1):
+            try:
+                ser = serial.Serial(BLUETOOTH_COM_PORT, BAUD_RATE, timeout=0.5)
+                logger.info("Port opened successfully.")
+                break
+            except OSError as e:
+                logger.warning("Open failed (attempt %d): %s", attempt, e)
+                if attempt < MAX_SERIAL_RETRIES:
+                    time.sleep(SERIAL_RETRY_DELAY)
+            except Exception as e:
+                logger.warning("Unexpected error: %s", e)
+                break
+
+        if ser is not None and ser.is_open:
+            if not perform_auth(ser):
+                logger.error("Authentication failed. Switching to simulation.")
+                ser.close()
+                ser = None
 
     if ser is not None and ser.is_open:
-        if perform_auth(ser):
-            logger.info("Hardware Verified.")
-            win = MainWindow(ser)
-            win.show()
-            sys.exit(app.exec_())
-        else:
-            logger.error("Hardware Authentication Failed. Switching to simulation.")
-            ser.close()
-            ser = None
-
-    if ser is None or not ser.is_open:
-        logger.info(">> SWITCHING TO SIMULATION MODE <<")
-        ser = MockSerial()
+        logger.info("Hardware Verified.")
         win = MainWindow(ser)
-        win.setWindowTitle(win.windowTitle() + " [SIMULATION MODE]")
         win.show()
         sys.exit(app.exec_())
+
+    logger.info(">> SWITCHING TO SIMULATION MODE <<")
+    ser = MockSerial()
+    win = MainWindow(ser)
+    win.setWindowTitle(win.windowTitle() + " [SIMULATION MODE]")
+    win.show()
+    sys.exit(app.exec_())

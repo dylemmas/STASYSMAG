@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp -R /d/workspace/ECC/skills/* /d/STASYSBASE/BASIC/.claude/skills/*)",
+      "Bash(cp /d/workspace/ECC/agents/*.md /d/STASYSBASE/BASIC/.claude/agents/)",
+      "Bash(cp /d/workspace/ECC/rules/common/*.md /d/STASYSBASE/BASIC/.claude/rules/)",
+      "Bash(cp /d/workspace/ECC/rules/cpp/*.md /d/STASYSBASE/BASIC/.claude/rules/)",
+      "Bash(cp /d/workspace/ECC/rules/python/*.md /d/STASYSBASE/BASIC/.claude/rules/)",
+      "Bash(cp /d/workspace/ECC/commands/*.md /d/STASYSBASE/BASIC/.claude/commands/)",
+      "Bash(ls -la /d/STASYSBASE/BASIC/.claude/*)"
+    ]
+  }
+}

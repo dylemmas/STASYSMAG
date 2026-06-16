@@ -20,6 +20,7 @@ import string
 import struct
 import logging
 from collections import deque
+from typing import List, Tuple
 import sqlite3
 import json
 from datetime import datetime
@@ -476,6 +477,73 @@ def perform_auth(ser):
     except Exception:
         logger.exception("Authentication error")
     return False
+
+
+# ================= DEVICE DISCOVERY =================
+
+def discover_stasys_devices() -> List[Tuple[serial.Serial, str]]:
+    """Scan all COM ports and return those that complete the STASYS handshake.
+
+    For each port: opens it, waits for READY, then performs the full auth handshake.
+    Returns a live serial.Serial object on success (NOT closed).
+
+    Returns:
+        List of (serial.Serial, description) tuples. First match wins.
+    """
+    found: List[Tuple[serial.Serial, str]] = []
+    candidates = [p.device for p in serial.tools.list_ports.comports()]
+    for port in sorted(candidates):
+        probe_ser = None
+        try:
+            probe_ser = serial.Serial(port, BAUD_RATE, timeout=1.0)
+            probe_ser.reset_input_buffer()
+            time.sleep(1.5)  # wait for firmware READY broadcast
+
+            ready_found = False
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if probe_ser.in_waiting:
+                    line = probe_ser.readline().decode('utf-8', errors='ignore').strip()
+                    if "READY" in line:
+                        ready_found = True
+                        break
+                time.sleep(0.05)
+
+            if not ready_found:
+                continue
+
+            # Full auth handshake: send challenge, verify response
+            challenge = ''.join(
+                random.choices(string.ascii_letters + string.digits,
+                               k=AUTH_CHALLENGE_LENGTH))
+            probe_ser.write(f"{challenge}\n".encode('utf-8'))
+
+            resp_found = False
+            auth_deadline = time.time() + AUTH_RESPONSE_TIMEOUT
+            while time.time() < auth_deadline:
+                if probe_ser.in_waiting:
+                    resp = probe_ser.readline().decode('utf-8', errors='ignore').strip()
+                    if not resp:
+                        continue
+                    expected = hashlib.sha256(
+                        (challenge + SECRET_KEY.decode('utf-8')).encode()
+                    ).hexdigest()
+                    if hmac.compare_digest(resp.lower(), expected.lower()):
+                        desc = getattr(probe_ser, 'description', '') or ''
+                        found.append((probe_ser, desc or port))
+                        logger.info("Found STASYS device on %s (%s)", port, desc or port)
+                        return found  # return alive connection immediately
+                    logger.warning("[AUTH] Hash mismatch — got: %r", resp)
+                time.sleep(0.01)
+
+        except OSError:
+            continue
+        except Exception:
+            continue
+        finally:
+            if probe_ser and probe_ser.is_open and probe_ser not in [f[0] for f in found]:
+                probe_ser.close()
+    return found
 
 
 # ================= CORE LOGIC =================
@@ -1888,50 +1956,49 @@ if __name__ == '__main__':
     setup_database()
     app = QApplication(sys.argv)
 
-    logger.info("Attempting connection to %s...", BLUETOOTH_COM_PORT)
-
-    # Windows Bluetooth SPP ports (especially on reconnect) often raise
-    # OSError 121 "semaphore timeout" because the RF link isn't fully
-    # established yet even though the COM port is registered.
-    # Fix: retry opening the port up to MAX_SERIAL_RETRIES times.
-    MAX_SERIAL_RETRIES = 10
-    SERIAL_RETRY_DELAY = 2.0   # seconds between retries
-
     ser = None
-    for attempt in range(1, MAX_SERIAL_RETRIES + 1):
-        try:
-            logger.info("Serial open attempt %d/%d on %s...",
-                        attempt, MAX_SERIAL_RETRIES, BLUETOOTH_COM_PORT)
-            ser = serial.Serial(BLUETOOTH_COM_PORT, BAUD_RATE, timeout=0.5)
-            logger.info("Port opened successfully.")
-            break
-        except OSError as e:
-            # Error 121 = semaphore timeout (BT link not ready yet)
-            # Error   2 = port not found (device not paired/connected)
-            logger.warning("Open failed (attempt %d): %s", attempt, e)
-            if attempt < MAX_SERIAL_RETRIES:
-                logger.info("Retrying in %.0fs — make sure ESP32 is on and paired...",
-                            SERIAL_RETRY_DELAY)
-                time.sleep(SERIAL_RETRY_DELAY)
-        except Exception as e:
-            logger.warning("Unexpected error opening port: %s", e)
-            break
+
+    # Auto-discover STASYS device on any COM port
+    logger.info("Scanning for STASYS devices...")
+    discovered = discover_stasys_devices()
+
+    if discovered:
+        ser, desc = discovered[0]
+        logger.info("Connected to STASYS on %s — %s", ser.port, desc)
+        # Auth already completed inside discover_stasys_devices
+    else:
+        # Fallback: try hardcoded port
+        logger.info("No device found — falling back to %s...", BLUETOOTH_COM_PORT)
+        MAX_SERIAL_RETRIES = 10
+        SERIAL_RETRY_DELAY = 2.0
+        for attempt in range(1, MAX_SERIAL_RETRIES + 1):
+            try:
+                ser = serial.Serial(BLUETOOTH_COM_PORT, BAUD_RATE, timeout=0.5)
+                logger.info("Port opened successfully.")
+                break
+            except OSError as e:
+                logger.warning("Open failed (attempt %d): %s", attempt, e)
+                if attempt < MAX_SERIAL_RETRIES:
+                    time.sleep(SERIAL_RETRY_DELAY)
+            except Exception as e:
+                logger.warning("Unexpected error: %s", e)
+                break
+
+        if ser is not None and ser.is_open:
+            if not perform_auth(ser):
+                logger.error("Authentication failed. Switching to simulation.")
+                ser.close()
+                ser = None
 
     if ser is not None and ser.is_open:
-        if perform_auth(ser):
-            logger.info("Hardware Verified.")
-            win = MainWindow(ser)
-            win.show()
-            sys.exit(app.exec_())
-        else:
-            logger.error("Hardware Authentication Failed. Switching to simulation.")
-            ser.close()
-            ser = None
-
-    if ser is None or not ser.is_open:
-        logger.info(">> SWITCHING TO SIMULATION MODE <<")
-        ser = MockSerial()
+        logger.info("Hardware Verified.")
         win = MainWindow(ser)
-        win.setWindowTitle(win.windowTitle() + " [SIMULATION MODE]")
         win.show()
         sys.exit(app.exec_())
+
+    logger.info(">> SWITCHING TO SIMULATION MODE <<")
+    ser = MockSerial()
+    win = MainWindow(ser)
+    win.setWindowTitle(win.windowTitle() + " [SIMULATION MODE]")
+    win.show()
+    sys.exit(app.exec_())
