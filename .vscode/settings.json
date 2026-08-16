@@ -1,7 +1,8 @@
 {
-    "python.defaultInterpreterPath": "C:\\Users\\Rakha\\AppData\\Local\\Microsoft\\WindowsApps\\python3.12.exe",
+    "python.defaultInterpreterPath": "C:\\Users\\Rakha\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\python.exe",
     "python.analysis.extraPaths": [
-        "stasys_app"
+        "${workspaceFolder}"
     ],
-    "python-envs.defaultEnvManager": "ms-python.python:system"
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "python.terminal.activateEnvironment": true
 }

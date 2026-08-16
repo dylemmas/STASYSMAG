@@ -14,35 +14,53 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'stasys_app'))
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-from base import ShotDetector, DEFAULT_SHOT_ROTATION_LIMIT, RECOIL_DURATION_IDX
+from base import (ShotDetector, DEFAULT_SHOT_ROTATION_LIMIT, RECOIL_DURATION_IDX,
+                  HOLD_GAP_BEFORE_BREAK)
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 
-def make_packet(rot=0.0, piezo=0, accel=(0.0, 0.0, 9.81), battery=80):
-    """Build a packet tuple matching the (ax, ay, az, gx, gy, gz, piezo, bat) shape.
+def make_packet(rot=0.0, piezo=0, accel=(0.0, 0.0, 9.81), battery=80,
+                mag=(280, -50, -400)):
+    """Build a packet tuple matching the new 11-tuple shape:
+       (ax, ay, az, gx, gy, gz, mag_x, mag_y, mag_z, piezo, bat).
 
     The accel tuple is left near 1G to avoid disturbing orientation math;
     rot is the desired gyro magnitude, applied equally to all three axes.
+    Mag defaults to typical Earth field in mG (raw LSB at gain 1090).
     """
     s = rot / math.sqrt(3.0)
     return (
         accel[0], accel[1], accel[2],
         s, s, s,
+        mag[0], mag[1], mag[2],
         piezo, battery,
     )
 
 
-def force_state(detector, state, state_timer=None, stable_under_count=10):
+def force_state(detector, state, state_timer=None, stable_under_count=10,
+                prime_buffer=False):
     """Bypass the IDLE→ARMING→ARMED handshake and put the detector in the
     state we want to test, fully primed as if it had already been stable.
 
     stable_under_count defaults to `_stable_under_needed` so a single normal
-    sample is enough to trip the trigger."""
+    sample is enough to trip the trigger.
+    If prime_buffer=True, pre-fills the telemetry buffer with enough calm
+    samples so that analyze_shot() has sufficient history for the larger
+    HOLD_GAP_BEFORE_BREAK window.
+    """
     detector.state = state
     if state_timer is not None:
         detector.state_timer = state_timer
     detector._stable_under_count = stable_under_count
+    if prime_buffer:
+        # Fill buffer with enough calm samples so T_0 has sufficient history
+        needed = HOLD_GAP_BEFORE_BREAK + RECOIL_DURATION_IDX + 50
+        for _ in range(needed):
+            detector.process(calm_packet(rot=0.0))
+        # Reset the stability counter — the priming ran through the state
+        # machine and incremented it; we set it below to let the test control it.
+        detector._stable_under_count = stable_under_count
 
 
 def calm_packet(rot=0.0):
@@ -117,7 +135,7 @@ def test_stable_under_counter_resets_on_single_high_rotation_sample():
 def test_ten_consecutive_calm_samples_allow_trigger():
     """After 100ms (10 samples) of calm, a trigger packet should fire."""
     det = ShotDetector()
-    force_state(det, "ARMED", stable_under_count=0)
+    force_state(det, "ARMED", stable_under_count=0, prime_buffer=True)
 
     for _ in range(10):
         result = det.process(calm_packet(rot=0.0))
@@ -138,7 +156,7 @@ def test_ten_consecutive_calm_samples_allow_trigger():
 def test_already_stable_state_triggers_immediately():
     """A primed ARMED state (counter at threshold) should fire on next trigger packet."""
     det = ShotDetector()
-    force_state(det, "ARMED", stable_under_count=10)
+    force_state(det, "ARMED", stable_under_count=10, prime_buffer=True)
 
     det.process(trigger_packet(mode=0))
     result = drain_post_gather(det)
@@ -165,7 +183,7 @@ def test_intermittent_high_rotation_resets_counter_each_time():
 def test_just_under_limit_samples_count_as_stable():
     """A sample at exactly rotation_limit - epsilon is still 'stable'."""
     det = ShotDetector()
-    force_state(det, "ARMED", stable_under_count=0)
+    force_state(det, "ARMED", stable_under_count=0, prime_buffer=True)
 
     just_under = det.rotation_limit - 0.001
     for _ in range(10):
@@ -224,7 +242,7 @@ def test_live_fire_jerk_trigger_also_respects_stability_gate():
     det = ShotDetector()
     det.trigger_mode = 1
     det.accel_thresh = 10.0  # low threshold so the jerk packet trips it
-    force_state(det, "ARMED", stable_under_count=0)
+    force_state(det, "ARMED", stable_under_count=0, prime_buffer=True)
 
     # High rotation — no trigger
     result = det.process(make_packet(rot=8.0, piezo=0, accel=(500.0, 0.0, 9.81)))

@@ -17,9 +17,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'stasys_app'))
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-from PyQt5.QtCore import QPointF
-from PyQt5.QtGui import QPainter, QPainterPath
-from PyQt5.QtWidgets import QApplication
+from PyQt6.QtCore import QPointF
+from PyQt6.QtGui import QPainter, QPainterPath
+from PyQt6.QtWidgets import QApplication
 import pytest
 
 from base import AimCanvas, ShotTraceCanvas

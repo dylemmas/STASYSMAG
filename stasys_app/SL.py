@@ -39,7 +39,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout, QPushButton, QLabel, QListWidget,
     QComboBox, QDoubleSpinBox, QGridLayout, QFrame,
     QProgressBar, QTabWidget, QSplitter, QSlider,
-    QScrollArea, QSizePolicy)
+    QScrollArea, QSizePolicy, QDialog, QRadioButton)
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import (
     QColor, QPainter, QPen, QRadialGradient,
@@ -54,7 +54,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ================= CONFIGURATION =================
-BLUETOOTH_COM_PORT = 'COM22'
+BLUETOOTH_COM_PORT = 'COM15'
 BAUD_RATE = 115200
 
 SECRET_KEY = os.environ.get(
@@ -62,11 +62,23 @@ SECRET_KEY = os.environ.get(
 ).encode('utf-8')
 
 # Timing & Protocol
-PACKET_SIZE         = 30
+PACKET_SIZE         = 36
 PACKET_HEADER       = b'\xAA\xBB'
-PACKET_FORMAT       = '<ffffffHB'      # ax, ay, az, gx, gy, gz, piezo, bat
-PACKET_PAYLOAD_SIZE = struct.calcsize(PACKET_FORMAT)   # 27 bytes
+PACKET_FORMAT       = '<ffffffhhhHB'  # ax,ay,az, gx,gy,gz, mag_x,mag_y,mag_z, piezo, bat = 33 bytes payload
+PACKET_PAYLOAD_SIZE = struct.calcsize(PACKET_FORMAT)   # 33 bytes
 DT                  = 0.01             # 10 ms  (100 Hz firmware)
+
+# QMC5883P sensitivity at ±30 Gauss full-scale: ~655 LSB / Gauss
+MAG_GAIN_LSB_PER_GA = 655.0
+
+# Mahony AHRS filter gains
+MAHONY_KP_ACC = 1.0
+MAHONY_KP_MAG = 1.0
+MAHONY_KI     = 0.0
+
+# Auto-disable magnetometer correction when reading norm deviates >40% from
+# calibrated reference (MantisX-style: hide mag interference from user).
+MAG_NORM_TOLERANCE = 0.40
 
 # Detection
 STABILITY_WINDOW_MS        = 200
@@ -79,12 +91,15 @@ ARMED_ROT_LIMIT            = 6.0
 DEFAULT_SHOT_ROTATION_LIMIT = 4.0  # rad/s
 SHOT_STABILITY_MIN_SAMPLES  = 10   # 100ms @ 100Hz
 
-HOLD_DURATION_IDX     = 100   # 1.0s pre-shot stability window (1000–2000ms before break)
-PRESS_DURATION_IDX    = 15    # 0.15s trigger-pull window (150–300ms before break)
-RECOIL_DURATION_IDX   = 50    # 0.5s follow-through window (500–1000ms after break)
-HOLD_GAP_BEFORE_BREAK = 200   # farthest look-back for Hold: 2000ms = 200 samples
-TOTAL_HISTORY_NEEDED  = HOLD_GAP_BEFORE_BREAK + RECOIL_DURATION_IDX + 10
+HOLD_DURATION_IDX     = 300   # 3.0s pre-shot stability window
+PRESS_DURATION_IDX    = 20    # 0.2s trigger-pull window
+RECOIL_DURATION_IDX   = 100   # 1.0s follow-through window
+HOLD_GAP_BEFORE_BREAK = 300   # farthest look-back for Hold: 3000ms = 300 samples
+TOTAL_HISTORY_NEEDED  = HOLD_GAP_BEFORE_BREAK + RECOIL_DURATION_IDX + PRESS_DURATION_IDX + 50
 SHOT_PHASE_TOTAL      = HOLD_DURATION_IDX + PRESS_DURATION_IDX + RECOIL_DURATION_IDX
+
+TELEMETRY_BUF_SAMPLES = 500   # 5s @ 100Hz continuous buffer
+GYRO_RECOIL_THRESHOLD = 8.0   # rad/s — informational confirmation only
 
 # --- PIEZO RANGE FIX ---
 # Old firmware (~1kHz sampling) produced values 20-50 at idle, 50-200 on dryfire
@@ -137,6 +152,23 @@ A2C_FLINCH_THRESH       = 0.015    # rad — flinch detection threshold
 
 # ── Target & Impact ────────────────────────────────────────────────────────────
 DEFAULT_TARGET_DISTANCE = 10.0     # metres
+
+# ── Ballistic Compensation ─────────────────────────────────────────────────────
+# These correct the raw aim-point prediction to match actual pellet impact.
+# Without these, STASYS overestimates vertical accuracy by ~12mm at 10m
+# because it doesn't account for gravity drop during bullet flight.
+
+DEFAULT_MUZZLE_VELOCITY = 200.0   # m/s — typical air pistol (14-18 J)
+BULLET_MASS_G           = 0.52    # grams — standard .177 cal pellet
+GRAVITY_DROP_SCALE      = 1.0     # multiplier for tuning (1.0 = theoretical)
+
+# Trigger pull compensation: average trigger pull time for air pistol
+# This is the delay between trigger break detection and bullet exit.
+# During this time, the gun continues moving — we extrapolate from
+# the press phase velocity to predict actual barrel position at exit.
+DEFAULT_TRIGGER_PULL_TIME = 0.050  # seconds — 50ms typical for air pistol
+
+
 
 
 # ── Firearm / Training Mode ────────────────────────────────────────────────────
@@ -359,6 +391,125 @@ def _quat_from_accel(ax: float, ay: float, az: float) -> np.ndarray:
                      axis[0]*s, axis[1]*s, axis[2]*s])
 
 
+def _quat_from_accel_mag(ax: float, ay: float, az: float,
+                         mx: float, my: float, mz: float,
+                         declination_deg: float = 0.0) -> np.ndarray:
+    """Initialize quaternion from accel (roll/pitch) + mag (heading)."""
+    q_tilt = _quat_from_accel(ax, ay, az)
+    m_world = _quat_rotate_vector(q_tilt, np.array([mx, my, mz]))
+    # Apply declination offset (rotate about world-Z axis)
+    dec_rad = math.radians(declination_deg)
+    cos_d, sin_d = math.cos(dec_rad), math.sin(dec_rad)
+    m_world[0], m_world[1] = (
+        cos_d * m_world[0] + sin_d * m_world[1],
+        -sin_d * m_world[0] + cos_d * m_world[1],
+    )
+    heading = math.atan2(m_world[1], m_world[0])
+    cy, sy = math.cos(heading / 2.0), math.sin(heading / 2.0)
+    q_yaw = np.array([cy, 0.0, 0.0, sy], dtype=np.float64)
+    return _quat_normalize(_quat_multiply(q_tilt, q_yaw))
+
+
+def _mahony_step(q: np.ndarray,
+                 wx: float, wy: float, wz: float,
+                 ax: float, ay: float, az: float,
+                 mx: float, my: float, mz: float,
+                 dt: float,
+                 calibrated_mag_norm: float = 0.0,
+                 ref_mag_world: list = None) -> np.ndarray:
+    """Mahony AHRS filter step: fuse gyro + accel + mag into quaternion."""
+    qw, qx, qy, qz = q
+
+    # ── Normalize accelerometer (gravity reference) ────────────────────────
+    a_norm = math.sqrt(ax * ax + ay * ay + az * az)
+    if a_norm < 1e-6:
+        accel_valid = False
+    else:
+        ax, ay, az = ax / a_norm, ay / a_norm, az / a_norm
+        accel_valid = True
+
+    # ── Normalize magnetometer (heading reference) ─────────────────────────
+    m_norm = math.sqrt(mx * mx + my * my + mz * mz)
+    mag_valid = False
+    if m_norm >= 1e-6:
+        # Auto-disable: reject mag if norm deviates > MAG_NORM_TOLERANCE from
+        # the calibrated reference norm (indicates local magnetic anomaly).
+        if calibrated_mag_norm > 1e-6:
+            ratio = m_norm / calibrated_mag_norm
+            if not (1.0 - MAG_NORM_TOLERANCE <= ratio <= 1.0 + MAG_NORM_TOLERANCE):
+                pass  # mag is anomalous — skip correction this step
+            else:
+                mx, my, mz = mx / m_norm, my / m_norm, mz / m_norm
+                mag_valid = True
+        else:
+            # No calibration reference yet — accept any non-zero mag reading
+            mx, my, mz = mx / m_norm, my / m_norm, mz / m_norm
+            mag_valid = True
+
+    # ── Estimated gravity in body frame (rotate world-up [0,0,1] by q) ──────
+    est_gx = 2.0 * (qx * qz - qw * qy)
+    est_gy = 2.0 * (qw * qx + qy * qz)
+    est_gz = qw * qw - qx * qx - qy * qy + qz * qz
+
+    # ── Accelerometer correction ────────────────────────────────────────────
+    if accel_valid:
+        cx = ay * est_gz - az * est_gy
+        cy = az * est_gx - ax * est_gz
+        cz = ax * est_gy - ay * est_gx
+        wx += MAHONY_KP_ACC * cx
+        wy += MAHONY_KP_ACC * cy
+        wz += MAHONY_KP_ACC * cz
+
+    # ── Magnetometer correction ─────────────────────────────────────────────
+    # Use a FIXED world-frame reference direction (stored at calibration)
+    # instead of deriving it from the measured mag (which creates a circular
+    # reference that always produces zero cross product).
+    if mag_valid:
+        # Reference direction in world frame (magnetic north at calibration)
+        if ref_mag_world is not None:
+            ref_wx, ref_wy, ref_wz = ref_mag_world[0], ref_mag_world[1], ref_mag_world[2]
+        else:
+            # Fallback: derive from measured world mag (same circular issue, but
+            # only used when no calibration ref is available)
+            wx_m = (2.0 * mx * (0.5 - qy * qy - qz * qz)
+                    + 2.0 * my * (qx * qy - qw * qz)
+                    + 2.0 * mz * (qx * qz + qw * qy))
+            wy_m = (2.0 * mx * (qx * qy + qw * qz)
+                    + 2.0 * my * (0.5 - qx * qx - qz * qz)
+                    + 2.0 * mz * (qy * qz - qw * qx))
+            wz_m = (2.0 * mx * (qx * qz - qw * qy)
+                    + 2.0 * my * (qy * qz + qw * qx)
+                    + 2.0 * mz * (0.5 - qx * qx - qy * qy))
+            horiz_norm = math.sqrt(wx_m * wx_m + wy_m * wy_m)
+            ref_wx = wx_m / horiz_norm if horiz_norm > 1e-6 else 1.0
+            ref_wy = wy_m / horiz_norm if horiz_norm > 1e-6 else 0.0
+            ref_wz = 0.0
+
+        # Rotate reference INTO body frame using current q (forward rotation)
+        # body_expected = q × ref_world × q*
+        exp_x = ((1.0 - 2.0 * qy * qy - 2.0 * qz * qz) * ref_wx
+                 + 2.0 * (qx * qy + qw * qz) * ref_wy
+                 + 2.0 * (qx * qz - qw * qy) * ref_wz)
+        exp_y = (2.0 * (qx * qy - qw * qz) * ref_wx
+                 + (1.0 - 2.0 * qx * qx - 2.0 * qz * qz) * ref_wy
+                 + 2.0 * (qy * qz + qw * qx) * ref_wz)
+        exp_z = (2.0 * (qx * qz + qw * qy) * ref_wx
+                 + 2.0 * (qy * qz - qw * qx) * ref_wy
+                 + (1.0 - 2.0 * qx * qx - 2.0 * qy * qy) * ref_wz)
+
+        # Step 4: cross product measured_body × expected_body
+        ex = my * exp_z - mz * exp_y
+        ey = mz * exp_x - mx * exp_z
+        ez = mx * exp_y - my * exp_x
+
+        wx += MAHONY_KP_MAG * ex
+        wy += MAHONY_KP_MAG * ey
+        wz += MAHONY_KP_MAG * ez
+
+    # ── Integrate corrected gyro ─────────────────────────────────────────────
+    return _quat_integrate(q, wx, wy, wz, dt)
+
+
 # ================= MOCK SERIAL =================
 
 class MockSerial:
@@ -399,7 +550,11 @@ class MockSerial:
             piezo = int(random.uniform(0, 50))
             bat   = 85
 
-            payload = struct.pack(PACKET_FORMAT, ax, ay, az, gx, gy, gz, piezo, bat)
+            mx = max(-32767, min(32767, int(random.gauss(280, 30))))
+            my = max(-32767, min(32767, int(random.gauss(-50, 30))))
+            mz = max(-32767, min(32767, int(random.gauss(-400, 30))))
+
+            payload = struct.pack(PACKET_FORMAT, ax, ay, az, gx, gy, gz, mx, my, mz, piezo, bat)
             calc_sum = 0
             for b in payload:
                 calc_sum ^= b
@@ -487,7 +642,17 @@ def setup_database():
             q_w REAL, q_x REAL, q_y REAL, q_z REAL,
             accel_bias_x REAL, accel_bias_y REAL, accel_bias_z REAL,
             calibrated_at TEXT,
-            sample_count INTEGER)''')
+            sample_count INTEGER,
+            mag_bias_x REAL,
+            mag_bias_y REAL,
+            mag_bias_z REAL)''')
+        # Migrate older DBs that lack mag_bias columns
+        existing_cols = {row[1] for row in conn.execute(
+            "PRAGMA table_info(device_calibrations)")}
+        if 'mag_bias_x' not in existing_cols:
+            conn.execute("ALTER TABLE device_calibrations ADD COLUMN mag_bias_x REAL")
+            conn.execute("ALTER TABLE device_calibrations ADD COLUMN mag_bias_y REAL")
+            conn.execute("ALTER TABLE device_calibrations ADD COLUMN mag_bias_z REAL")
         conn.commit()
 
 
@@ -577,20 +742,24 @@ class ShotGroupAnalyzer:
 
 # ── Device Calibration Persistence ────────────────────────────────────────────
 
-def save_device_calibration(device_key, gyro_bias, q, accel_bias, sample_count):
+def save_device_calibration(device_key, gyro_bias, q, accel_bias, sample_count,
+                             mag_bias=None):
     """Save (upsert) calibration for a device key (COM port)."""
+    mag = mag_bias or [0.0, 0.0, 0.0]
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute('''INSERT OR REPLACE INTO device_calibrations
                         (device_key, gyro_bias_x, gyro_bias_y, gyro_bias_z,
                          q_w, q_x, q_y, q_z,
                          accel_bias_x, accel_bias_y, accel_bias_z,
-                         calibrated_at, sample_count)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                         calibrated_at, sample_count,
+                         mag_bias_x, mag_bias_y, mag_bias_z)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                      (device_key,
                       gyro_bias[0], gyro_bias[1], gyro_bias[2],
                       q[0], q[1], q[2], q[3],
                       accel_bias[0], accel_bias[1], accel_bias[2],
-                      datetime.now().isoformat(), sample_count))
+                      datetime.now().isoformat(), sample_count,
+                      mag[0], mag[1], mag[2]))
         conn.commit()
 
 
@@ -601,7 +770,8 @@ def load_device_calibration(device_key):
         row = conn.execute('''SELECT gyro_bias_x, gyro_bias_y, gyro_bias_z,
                                      q_w, q_x, q_y, q_z,
                                      accel_bias_x, accel_bias_y, accel_bias_z,
-                                     sample_count
+                                     sample_count,
+                                     mag_bias_x, mag_bias_y, mag_bias_z
                               FROM device_calibrations WHERE device_key = ?''',
                           (device_key,)).fetchone()
         if row:
@@ -609,6 +779,11 @@ def load_device_calibration(device_key):
                 'gyro_bias': [row['gyro_bias_x'], row['gyro_bias_y'], row['gyro_bias_z']],
                 'q': [row['q_w'], row['q_x'], row['q_y'], row['q_z']],
                 'accel_bias': [row['accel_bias_x'], row['accel_bias_y'], row['accel_bias_z']],
+                'mag_bias': [
+                    row['mag_bias_x'] or 0.0,
+                    row['mag_bias_y'] or 0.0,
+                    row['mag_bias_z'] or 0.0,
+                ],
                 'sample_count': row['sample_count'],
             }
         return None
@@ -746,6 +921,90 @@ def load_settings():
     except Exception as e:
         logger.error("Failed to load settings: %s", e)
         return {}
+
+
+# ================= STARTUP MODE DIALOG =================
+
+class StartupDialog(QDialog):
+    """Dialog to select Connection Mode or Simulation Mode at startup."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("STASYS App — Startup Mode")
+        self.setModal(True)
+        self.setMinimumWidth(400)
+        self.setMinimumHeight(160)
+
+        settings = load_settings()
+        saved_mode = settings.get('connection_mode', 'connection')
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("Select Startup Mode")
+        title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        layout.addWidget(title)
+
+        self.conn_radio = QRadioButton("Connection Mode — connect to STASYS hardware")
+        self.sim_radio = QRadioButton("Simulation Mode — use MockSerial")
+        self.conn_radio.setChecked(saved_mode != 'simulation')
+        self.sim_radio.setChecked(saved_mode == 'simulation')
+
+        layout.addWidget(self.conn_radio)
+        layout.addWidget(self.sim_radio)
+
+        layout.addStretch()
+
+        btn_layout = QHBoxLayout()
+        start_btn = QPushButton("Start")
+        start_btn.clicked.connect(self.accept)
+        btn_layout.addStretch()
+        btn_layout.addWidget(start_btn)
+        layout.addLayout(btn_layout)
+
+    def get_mode(self):
+        return "simulation" if self.sim_radio.isChecked() else "connection"
+
+
+# ================= STARTUP DIALOG =================
+
+class StartupDialog(QDialog):
+    """Dialog to select Connection Mode or Simulation Mode at startup."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("STASYS App — Startup Mode")
+        self.setModal(True)
+        self.setMinimumWidth(400)
+        self.setMinimumHeight(160)
+
+        settings = load_settings()
+        saved_mode = settings.get('connection_mode', 'connection')
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("Select Startup Mode")
+        title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        layout.addWidget(title)
+
+        self.conn_radio = QRadioButton("Connection Mode — connect to STASYS hardware")
+        self.sim_radio = QRadioButton("Simulation Mode — use MockSerial")
+        self.conn_radio.setChecked(saved_mode != 'simulation')
+        self.sim_radio.setChecked(saved_mode == 'simulation')
+
+        layout.addWidget(self.conn_radio)
+        layout.addWidget(self.sim_radio)
+
+        layout.addStretch()
+
+        btn_layout = QHBoxLayout()
+        start_btn = QPushButton("Start")
+        start_btn.clicked.connect(self.accept)
+        btn_layout.addStretch()
+        btn_layout.addWidget(start_btn)
+        layout.addLayout(btn_layout)
+
+    def get_mode(self):
+        return "simulation" if self.sim_radio.isChecked() else "connection"
 
 
 # ================= PACKET PARSING =================
@@ -940,24 +1199,26 @@ class ShotDetector:
         self.pending_trigger       = False
         self.trigger_confirm_count = 0
 
-        # ── Instant result cache ────────────────────────────────────────────
-        self.pending_shot_result    = None
-        self.shot_result_returned   = False
-        self.last_trigger_piezo_for_result = 0
-
-        # ── Frozen buffer for 3-phase extraction ────────────────────────────
-        self.is_recording     = True
-        self.frozen_trace_x   = None
-        self.frozen_trace_y   = None
-        self.frozen_trigger_idx = -1
+        # ── T0 tracking for telemetry buffer ────────────────────────────────
+        self.last_shot_t0_idx = -1
 
         # ── Accelerometer bias (stored alongside gyro bias) ───────────────────
         self.accel_bias = [0.0, 0.0, 0.0]
 
+        # ── Magnetometer bias (hard-iron offset in mG, set during calibrate) ──
+        self.mag_bias = [0.0, 0.0, 0.0]
+        self.calibrated_mag_norm = 0.0
+        # World-frame magnetic reference direction (set at calibrate)
+        self.ref_mag_world = [0.0, 0.0, 0.0]
+        self.mag_anomaly_logged  = False
+        self.magnetic_declination_deg = 0.0
+
         # ── Mount direction: "forward" or "backward" barrel flip ──────────────
         self.mount_direction = "forward"
 
-        self.buf_size = TOTAL_HISTORY_NEEDED * 2
+        self.buf_size = TELEMETRY_BUF_SAMPLES
+        self.telemetry_buf = deque(maxlen=self.buf_size)
+        # Each entry: (ax,ay,az, gx,gy,gz, mx,my,mz, piezo, bat, curr_x, curr_y)
         self.trace_x  = deque([0.0] * self.buf_size, maxlen=self.buf_size)
         self.trace_y  = deque([0.0] * self.buf_size, maxlen=self.buf_size)
         self.curr_x   = 0.0
@@ -1003,9 +1264,38 @@ class ShotDetector:
         mean_az = sum(s[2] for s in samples) / cnt
 
         if source == "manual":
-            self.accel_bias = [mean_ax, mean_ay, mean_az]
-
-        self.q = _quat_from_accel(mean_ax, mean_ay, mean_az)
+            # NOTE: Do NOT store raw accelerometer mean as accel_bias here.
+            # At rest the accelerometer reads gravity (~9.81 m/s²), so storing
+            # it as a bias would cause process() to subtract gravity from the
+            # input fed into Mahony, leaving the filter with no gravity
+            # reference and allowing gyro bias to drift the aim upright.
+            self.accel_bias = [0.0, 0.0, 0.0]
+            # Compute mag bias and calibrated norm from calibration samples
+            has_mag = any(s[6] or s[7] or s[8] for s in samples)
+            if has_mag:
+                mean_mx = sum(s[6] for s in samples) / cnt
+                mean_my = sum(s[7] for s in samples) / cnt
+                mean_mz = sum(s[8] for s in samples) / cnt
+                self.mag_bias = [mean_mx, mean_my, mean_mz]
+                self.calibrated_mag_norm = math.sqrt(
+                    mean_mx**2 + mean_my**2 + mean_mz**2)
+                # Store world-frame magnetic reference (in mG)
+                # Convert body-frame bias to world frame for later use
+                self.ref_mag_world = [mean_mx, mean_my, mean_mz]
+                # Normalize for reference direction
+                ref_norm = math.sqrt(mean_mx**2 + mean_my**2 + mean_mz**2)
+                if ref_norm > 1e-6:
+                    self.ref_mag_world = [mean_mx/ref_norm, mean_my/ref_norm, mean_mz/ref_norm]
+                else:
+                    self.ref_mag_world = [0.0, 1.0, 0.0]  # default: north along +Y
+                self.q = _quat_from_accel_mag(
+                    mean_ax, mean_ay, mean_az,
+                    mean_mx, mean_my, mean_mz,
+                    self.magnetic_declination_deg)
+            else:
+                self.q = _quat_from_accel(mean_ax, mean_ay, mean_az)
+        else:
+            self.q = _quat_from_accel(mean_ax, mean_ay, mean_az)
         self._apply_tare()
         self.is_calibrated = True
         logger.info(
@@ -1066,7 +1356,8 @@ class ShotDetector:
     # ── Per-packet processing ────────────────────────────────────────────────
 
     def process(self, packet):
-        raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz, piezo, bat = packet
+        raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz, \
+            raw_mx, raw_my, raw_mz, piezo, bat = packet
 
         # Store raw gyros for stationary detection
         self.gx_raw = raw_gx
@@ -1084,8 +1375,24 @@ class ShotDetector:
         wy = GYRO_SIGN_Y * raw_gyros[GYRO_AXIS_Y]
         wz = GYRO_SIGN_Z * raw_gyros[GYRO_AXIS_Z]
 
-        # 3. Integrate orientation quaternion
-        self.q = _quat_integrate(self.q, wx, wy, wz, DT)
+        # 3. Convert raw mag (LSB) to mG
+        mx_mg = raw_mx / MAG_GAIN_LSB_PER_GA
+        my_mg = raw_my / MAG_GAIN_LSB_PER_GA
+        mz_mg = raw_mz / MAG_GAIN_LSB_PER_GA
+
+        # 4. AHRS step: fuse gyro + accel + mag
+        self.q = _mahony_step(
+            self.q, wx, wy, wz,
+            raw_ax - self.accel_bias[0],
+            raw_ay - self.accel_bias[1],
+            raw_az - self.accel_bias[2],
+            mx_mg - self.mag_bias[0],
+            my_mg - self.mag_bias[1],
+            mz_mg - self.mag_bias[2],
+            DT,
+            self.calibrated_mag_norm,
+            self.ref_mag_world,
+        )
 
         # 4. Relative (tared) quaternion
         q_rel = _quat_normalize(
@@ -1096,6 +1403,11 @@ class ShotDetector:
         self.curr_x = math.atan2(-v[1], v[2]) * SCREEN_X_SIGN
         self.curr_y = math.atan2( v[0], v[2]) * SCREEN_Y_SIGN
 
+        # Append to telemetry buffer (raw packet + computed aim)
+        self.telemetry_buf.append((
+            raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz,
+            raw_mx, raw_my, raw_mz, piezo, bat,
+            self.curr_x, self.curr_y))
         self.trace_x.append(self.curr_x)
         self.trace_y.append(self.curr_y)
 
@@ -1161,6 +1473,8 @@ class ShotDetector:
                         "SHOT TRIGGERED — Piezo: %d, Rot: %.2f, stable: %d",
                         piezo, rot_mag, self._stable_under_count)
                     self.last_trigger_piezo = piezo
+                    self.last_shot_t0_idx = len(self.telemetry_buf) - 1
+                    self._recoil_confirmed = False
                     self.state          = "POST_GATHER"
                     self.gather_counter = RECOIL_DURATION_IDX
                     self._stable_under_count = 0
@@ -1174,6 +1488,12 @@ class ShotDetector:
                 self._stable_under_count = 0
 
         elif self.state == "POST_GATHER":
+            # Informational gyro recoil confirmation (doesn't gate the shot)
+            if not getattr(self, '_recoil_confirmed', False):
+                if rot_mag > GYRO_RECOIL_THRESHOLD:
+                    self._recoil_confirmed = True
+                    logger.info(
+                        "Gyro recoil confirmed — rotation %.2f rad/s", rot_mag)
             self.gather_counter -= 1
             if self.gather_counter <= 0:
                 shot_data        = self.analyze_shot()
@@ -1283,29 +1603,29 @@ class ShotDetector:
     # ── Shot analysis ────────────────────────────────────────────────────────
 
     def analyze_shot(self):
-        hist_len     = len(self.trace_x)
-        total_needed = HOLD_GAP_BEFORE_BREAK + RECOIL_DURATION_IDX
-        if hist_len < total_needed:
+        t0_idx = self.last_shot_t0_idx
+        if t0_idx < 0:
             return None
 
-        full_x = list(self.trace_x)
-        full_y = list(self.trace_y)
+        buf_len = len(self.telemetry_buf)
+        if t0_idx >= buf_len:
+            return None
 
-        idx_recoil_end  = len(full_x)
-        idx_break       = idx_recoil_end - RECOIL_DURATION_IDX
-        idx_press_start = idx_break - PRESS_DURATION_IDX
-        idx_hold_start  = idx_break - HOLD_GAP_BEFORE_BREAK
+        idx_break       = t0_idx
+        idx_recoil_end  = min(t0_idx + RECOIL_DURATION_IDX, buf_len)
+        idx_press_start = t0_idx - PRESS_DURATION_IDX
+        idx_hold_start  = t0_idx - HOLD_GAP_BEFORE_BREAK
         idx_hold_end    = idx_hold_start + HOLD_DURATION_IDX
         if idx_hold_start < 0:
             return None
 
-        break_x = full_x[idx_break]
-        break_y = full_y[idx_break]
+        break_x = self.telemetry_buf[idx_break][11]
+        break_y = self.telemetry_buf[idx_break][12]
 
-        def get_norm_segment(start, end):
+        def get_norm_segment(start, end, idx_x=11, idx_y=12):
             return (
-                [x - break_x for x in full_x[start:end]],
-                [y - break_y for y in full_y[start:end]])
+                [self.telemetry_buf[i][idx_x] - break_x for i in range(start, end)],
+                [self.telemetry_buf[i][idx_y] - break_y for i in range(start, end)])
 
         hold_x,   hold_y   = get_norm_segment(idx_hold_start,  idx_hold_end)
         press_x,  press_y  = get_norm_segment(idx_press_start, idx_break + 1)
@@ -1351,10 +1671,49 @@ class ShotDetector:
         # ── Letter grade ───────────────────────────────────────────────────
         grade = self._letter_grade(score)
 
-        # ── Impact prediction (simple model at DEFAULT_TARGET_DISTANCE) ───
-        target_d = DEFAULT_TARGET_DISTANCE
-        impact_x_cm = round(a2c_x * target_d * 100, 2)
-        impact_y_cm = round(a2c_y * target_d * 100, 2)
+        # ── Impact prediction with ballistic compensation ──────────────────
+        # Use configurable parameters from settings (with fallbacks to defaults)
+        target_d = self.target_distance if hasattr(self, 'target_distance') else DEFAULT_TARGET_DISTANCE
+        mv = self.muzzle_velocity if hasattr(self, 'muzzle_velocity') else DEFAULT_MUZZLE_VELOCITY
+        tpt = self.trigger_pull_time if hasattr(self, 'trigger_pull_time') else DEFAULT_TRIGGER_PULL_TIME
+
+        # 1. Raw aim-point prediction from A2C
+        raw_impact_x_cm = a2c_x * target_d * 100
+        raw_impact_y_cm = a2c_y * target_d * 100
+
+        # 2. Bullet drop compensation (gravity drops pellet during flight)
+        # Flight time = distance / muzzle_velocity
+        # Vertical drop = 0.5 * g * t²
+        # At 10m with 200 m/s: t = 0.05s, drop = 12.3mm
+        flight_time = target_d / mv
+        bullet_drop_cm = 0.5 * GRAVITY_NOMINAL * (flight_time ** 2) * 100 * GRAVITY_DROP_SCALE
+        # Bullet drops DOWN (negative Y in screen coords), so we subtract
+        compensated_impact_y_cm = raw_impact_y_cm - bullet_drop_cm
+        compensated_impact_x_cm = raw_impact_x_cm  # No horizontal drop
+
+        # 3. Trigger pull extrapolation
+        # Estimate angular velocity from press phase (last 15 samples before break)
+        press_vel_x = 0.0
+        press_vel_y = 0.0
+        if len(press_x) > 1 and len(press_y) > 1:
+            # Use last 5 samples for velocity estimate (most recent motion)
+            vel_samples = min(5, len(press_x) - 1)
+            press_vel_x = (press_x[-1] - press_x[-(vel_samples + 1)]) / (vel_samples * DT)
+            press_vel_y = (press_y[-1] - press_y[-(vel_samples + 1)]) / (vel_samples * DT)
+
+        # Extrapolate aim point forward by trigger pull time
+        trigger_pull_offset_x = press_vel_x * tpt * target_d * 100
+        trigger_pull_offset_y = press_vel_y * tpt * target_d * 100
+        final_impact_x_cm = compensated_impact_x_cm + trigger_pull_offset_x
+        final_impact_y_cm = compensated_impact_y_cm + trigger_pull_offset_y
+
+        impact_x_cm = round(final_impact_x_cm, 2)
+        impact_y_cm = round(final_impact_y_cm, 2)
+
+        # Store compensation values for logging/debug
+        self.last_bullet_drop_cm = bullet_drop_cm
+        self.last_trigger_offset_x = trigger_pull_offset_x
+        self.last_trigger_offset_y = trigger_pull_offset_y
 
         # ── Aim trace for DB logging ────────────────────────────────────────
         aim_trace = {
@@ -1874,6 +2233,7 @@ class ReplayBar(QWidget):
     skipToEnd = pyqtSignal()
     stepRequested = pyqtSignal(int)
     scrubRequested = pyqtSignal(int)
+    playbackFinished = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1996,6 +2356,7 @@ class ReplayBar(QWidget):
             self._timer.stop()
             self._playing = False
             self.btn_play.setText("▶")
+            self.playbackFinished.emit()
             return
         self.stepRequested.emit(1)
 
@@ -2147,6 +2508,7 @@ class ShotFilmStrip(QWidget):
         self._scroll_area.setWidget(self._scroll_contents)
 
     def update_shots(self, shots: list[dict]) -> None:
+        selected_shot_number = self._selected_chip.text() if self._selected_chip else None
         for chip in self._chips:
             chip.setParent(None)
             chip.deleteLater()
@@ -2170,12 +2532,25 @@ class ShotFilmStrip(QWidget):
 
         self._scroll_layout.addStretch(1)
         if shots:
-            QTimer.singleShot(0, self._scroll_to_end)
+            if selected_shot_number is not None:
+                self.select_shot(int(selected_shot_number))
+                self._scroll_to_selected(selected_shot_number)
+            else:
+                QTimer.singleShot(0, self._scroll_to_end)
 
     def _scroll_to_end(self) -> None:
         hbar = self._scroll_area.horizontalScrollBar()
         if hbar:
             hbar.setValue(hbar.maximum())
+
+    def _scroll_to_selected(self, shot_number: str) -> None:
+        for i, chip in enumerate(self._chips):
+            if chip.text() == shot_number:
+                hbar = self._scroll_area.horizontalScrollBar()
+                if hbar:
+                    pos = chip.x() - self.width() // 2
+                    hbar.setValue(max(0, pos))
+                return
 
     def _on_chip_clicked(self, shot: dict, display_number: int) -> None:
         self.shot_selected.emit({**shot, 'shot_number': display_number})
@@ -2890,6 +3265,7 @@ class MainWindow(QMainWindow):
         self.replay_bar.skipToEnd.connect(self._on_replay_skip_end)
         self.replay_bar.stepRequested.connect(self._on_replay_step)
         self.replay_bar.scrubRequested.connect(self._on_replay_scrub)
+        self.replay_bar.playbackFinished.connect(self._on_replay_finished)
         trace_panel.addWidget(self.replay_bar)
 
         trace_frame = QFrame()
@@ -3237,6 +3613,120 @@ class MainWindow(QMainWindow):
         tab4_layout.addWidget(stability_section)
         tab4_layout.addSpacing(16)
 
+        # ── Ballistic Settings Section ─────────────────────────────────────
+        ballistic_section = QFrame()
+        ballistic_section.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['bg_secondary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
+                padding: 16px;
+            }}
+        """)
+        ballistic_layout = QVBoxLayout(ballistic_section)
+
+        ballistic_title = QLabel("Ballistic Settings")
+        ballistic_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        ballistic_title.setStyleSheet(f"color: {COLORS['accent_good']};")
+        ballistic_layout.addWidget(ballistic_title)
+
+        # Target Distance
+        dist_row = QHBoxLayout()
+        dist_lbl = QLabel("Target Distance (m):")
+        dist_lbl.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 13px;")
+        dist_lbl.setFixedWidth(160)
+        dist_row.addWidget(dist_lbl)
+
+        self.spin_target_distance = QDoubleSpinBox()
+        self.spin_target_distance.setRange(5.0, 100.0)
+        self.spin_target_distance.setSingleStep(0.5)
+        self.spin_target_distance.setValue(DEFAULT_TARGET_DISTANCE)
+        self.spin_target_distance.setFont(QFont("Segoe UI", 13))
+        self.spin_target_distance.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                border: 2px solid {COLORS['border']};
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 13px;
+            }}
+        """)
+        self.spin_target_distance.valueChanged.connect(self.change_ballistic_params)
+        dist_row.addWidget(self.spin_target_distance, 1)
+        ballistic_layout.addLayout(dist_row)
+
+        dist_hint = QLabel("Distance from shooter to target. Affects impact prediction and bullet drop compensation.")
+        dist_hint.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px;")
+        dist_hint.setWordWrap(True)
+        ballistic_layout.addWidget(dist_hint)
+
+        # Muzzle Velocity
+        mv_row = QHBoxLayout()
+        mv_lbl = QLabel("Muzzle Velocity (m/s):")
+        mv_lbl.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 13px;")
+        mv_lbl.setFixedWidth(160)
+        mv_row.addWidget(mv_lbl)
+
+        self.spin_muzzle_velocity = QDoubleSpinBox()
+        self.spin_muzzle_velocity.setRange(50.0, 400.0)
+        self.spin_muzzle_velocity.setSingleStep(10.0)
+        self.spin_muzzle_velocity.setValue(DEFAULT_MUZZLE_VELOCITY)
+        self.spin_muzzle_velocity.setFont(QFont("Segoe UI", 13))
+        self.spin_muzzle_velocity.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                border: 2px solid {COLORS['border']};
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 13px;
+            }}
+        """)
+        self.spin_muzzle_velocity.valueChanged.connect(self.change_ballistic_params)
+        mv_row.addWidget(self.spin_muzzle_velocity, 1)
+        ballistic_layout.addLayout(mv_row)
+
+        mv_hint = QLabel("Typical air pistol: 180-220 m/s. Affects bullet drop compensation.")
+        mv_hint.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px;")
+        mv_hint.setWordWrap(True)
+        ballistic_layout.addWidget(mv_hint)
+
+        # Trigger Pull Time
+        tpt_row = QHBoxLayout()
+        tpt_lbl = QLabel("Trigger Pull (ms):")
+        tpt_lbl.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 13px;")
+        tpt_lbl.setFixedWidth(160)
+        tpt_row.addWidget(tpt_lbl)
+
+        self.spin_trigger_pull = QDoubleSpinBox()
+        self.spin_trigger_pull.setRange(10.0, 200.0)
+        self.spin_trigger_pull.setSingleStep(5.0)
+        self.spin_trigger_pull.setValue(DEFAULT_TRIGGER_PULL_TIME * 1000)
+        self.spin_trigger_pull.setSuffix(" ms")
+        self.spin_trigger_pull.setFont(QFont("Segoe UI", 13))
+        self.spin_trigger_pull.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                border: 2px solid {COLORS['border']};
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 13px;
+            }}
+        """)
+        self.spin_trigger_pull.valueChanged.connect(self.change_ballistic_params)
+        tpt_row.addWidget(self.spin_trigger_pull, 1)
+        ballistic_layout.addLayout(tpt_row)
+
+        tpt_hint = QLabel("Delay between trigger break and bullet exit. Estimates aim drift during this window.")
+        tpt_hint.setStyleSheet(f"color: {COLORS['text_muted']}; font-size: 11px;")
+        tpt_hint.setWordWrap(True)
+        ballistic_layout.addWidget(tpt_hint)
+
+        tab4_layout.addWidget(ballistic_section)
+        tab4_layout.addSpacing(16)
+
         # COM Port
         port_label = QLabel("COM Port")
         port_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; text-transform: uppercase; letter-spacing: 1px;")
@@ -3381,6 +3871,12 @@ class MainWindow(QMainWindow):
             self.replay_bar.stop_timer()
         self.shot_trace_canvas.update()
 
+    def _on_replay_finished(self):
+        if not hasattr(self, 'shot_trace_canvas') or not hasattr(self, 'replay_bar'):
+            return
+        self.shot_trace_canvas.replay_mode = False
+        self.shot_trace_canvas.update()
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             self.exit_app()
@@ -3440,6 +3936,22 @@ class MainWindow(QMainWindow):
         settings['shot_rotation_limit'] = value
         save_settings(settings)
 
+    def change_ballistic_params(self):
+        """Handle ballistic parameters spinbox changes."""
+        target_distance = self.spin_target_distance.value()
+        muzzle_velocity = self.spin_muzzle_velocity.value()
+        trigger_pull_ms = self.spin_trigger_pull.value()
+
+        self.target_distance = target_distance
+        self.muzzle_velocity = muzzle_velocity
+        self.trigger_pull_time = trigger_pull_ms / 1000.0
+
+        settings = load_settings()
+        settings['target_distance'] = target_distance
+        settings['muzzle_velocity'] = muzzle_velocity
+        settings['trigger_pull_time_ms'] = trigger_pull_ms
+        save_settings(settings)
+
     def update_thresholds(self):
         self.detector.accel_thresh = self.spin_jerk.value()
         self.detector.piezo_thresh = self.spin_piezo.value()
@@ -3464,6 +3976,21 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'spin_rotation_limit'):
             self.spin_rotation_limit.setValue(rotation_limit)
         self.detector.rotation_limit = rotation_limit
+
+        # Load ballistic parameters
+        target_distance = settings.get('target_distance', DEFAULT_TARGET_DISTANCE)
+        muzzle_velocity = settings.get('muzzle_velocity', DEFAULT_MUZZLE_VELOCITY)
+        trigger_pull_ms = settings.get('trigger_pull_time_ms', DEFAULT_TRIGGER_PULL_TIME * 1000)
+        self.target_distance = target_distance
+        self.muzzle_velocity = muzzle_velocity
+        self.trigger_pull_time = trigger_pull_ms / 1000.0
+
+        if hasattr(self, 'spin_target_distance'):
+            self.spin_target_distance.setValue(target_distance)
+        if hasattr(self, 'spin_muzzle_velocity'):
+            self.spin_muzzle_velocity.setValue(muzzle_velocity)
+        if hasattr(self, 'spin_trigger_pull'):
+            self.spin_trigger_pull.setValue(trigger_pull_ms)
 
         # Apply settings to canvas
         if hasattr(self, 'shot_trace_canvas'):
@@ -3697,49 +4224,62 @@ if __name__ == '__main__':
     setup_database()
     app = QApplication(sys.argv)
 
+    dialog = StartupDialog()
+    if dialog.exec_() != QDialog.Accepted:
+        sys.exit(0)
+
+    mode = dialog.get_mode()
+    save_settings({'connection_mode': mode})
+
+    sim_mode = False
     ser = None
 
-    # Auto-discover STASYS device on any COM port
-    logger.info("Scanning for STASYS devices...")
-    discovered = discover_stasys_devices()
+    if mode == 'connection':
+        # Auto-discover STASYS device on any COM port
+        logger.info("Scanning for STASYS devices...")
+        discovered = discover_stasys_devices()
 
-    if discovered:
-        ser, desc = discovered[0]
-        logger.info("Connected to STASYS on %s — %s", ser.port, desc)
-        # Auth already completed inside discover_stasys_devices
-    else:
-        # Fallback: try hardcoded port
-        logger.info("No device found — falling back to %s...", BLUETOOTH_COM_PORT)
-        MAX_SERIAL_RETRIES = 10
-        SERIAL_RETRY_DELAY = 2.0
-        for attempt in range(1, MAX_SERIAL_RETRIES + 1):
-            try:
-                ser = serial.Serial(BLUETOOTH_COM_PORT, BAUD_RATE, timeout=0.5)
-                logger.info("Port opened successfully.")
-                break
-            except OSError as e:
-                logger.warning("Open failed (attempt %d): %s", attempt, e)
-                if attempt < MAX_SERIAL_RETRIES:
-                    time.sleep(SERIAL_RETRY_DELAY)
-            except Exception as e:
-                logger.warning("Unexpected error: %s", e)
-                break
+        if discovered:
+            ser, desc = discovered[0]
+            logger.info("Connected to STASYS on %s — %s", ser.port, desc)
+        else:
+            # Fallback: try hardcoded port
+            logger.info("No device found — falling back to %s...", BLUETOOTH_COM_PORT)
+            MAX_SERIAL_RETRIES = 10
+            SERIAL_RETRY_DELAY = 2.0
+            for attempt in range(1, MAX_SERIAL_RETRIES + 1):
+                try:
+                    ser = serial.Serial(BLUETOOTH_COM_PORT, BAUD_RATE, timeout=0.5)
+                    logger.info("Port opened successfully.")
+                    break
+                except OSError as e:
+                    logger.warning("Open failed (attempt %d): %s", attempt, e)
+                    if attempt < MAX_SERIAL_RETRIES:
+                        time.sleep(SERIAL_RETRY_DELAY)
+                except Exception as e:
+                    logger.warning("Unexpected error: %s", e)
+                    break
+
+            if ser is not None and ser.is_open:
+                if not perform_auth(ser):
+                    logger.error("Authentication failed. Switching to simulation.")
+                    ser.close()
+                    ser = None
 
         if ser is not None and ser.is_open:
-            if not perform_auth(ser):
-                logger.error("Authentication failed. Switching to simulation.")
-                ser.close()
-                ser = None
+            logger.info("Hardware Verified.")
+        else:
+            logger.info(">> HARDWARE FALLBACK TO SIMULATION MODE <<")
+            ser = MockSerial()
+            sim_mode = True
+    else:
+        # Simulation Mode — skip hardware entirely
+        logger.info(">> SIMULATION MODE (user selected) <<")
+        ser = MockSerial()
+        sim_mode = True
 
-    if ser is not None and ser.is_open:
-        logger.info("Hardware Verified.")
-        win = MainWindow(ser)
-        win.show()
-        sys.exit(app.exec_())
-
-    logger.info(">> SWITCHING TO SIMULATION MODE <<")
-    ser = MockSerial()
     win = MainWindow(ser)
-    win.setWindowTitle(win.windowTitle() + " [SIMULATION MODE]")
+    if sim_mode:
+        win.setWindowTitle(win.windowTitle() + " [SIMULATION MODE]")
     win.show()
     sys.exit(app.exec_())

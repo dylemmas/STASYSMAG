@@ -1,9 +1,9 @@
 """Quick test to verify SVG target rendering works."""
 import sys
 from pathlib import Path
-from PyQt5.QtWidgets import QApplication
-from PyQt5.QtCore import QRectF
-from PyQt5.QtSvg import QSvgRenderer
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QRectF
+from PyQt6.QtSvg import QSvgRenderer
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))

@@ -3,7 +3,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'stasys_app'))
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-from PyQt5.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication
 import pytest
 
 from base import ShotTraceCanvas
@@ -60,9 +60,11 @@ def test_current_sample_xy_helper(qapp):
     c.playback_pos = 0
     assert c._current_sample_xy() == (0.0, 0.0)
 
-    # Mid-hold: sample 50
+    # Mid-hold: sample at HOLD_DURATION_IDX // 2
     c.playback_pos = HOLD_DURATION_IDX // 2
-    assert c._current_sample_xy() == pytest.approx((5.0, 25.0))
+    expected_mid_x = 0.1 * (HOLD_DURATION_IDX // 2)
+    expected_mid_y = 0.5 * (HOLD_DURATION_IDX // 2)
+    assert c._current_sample_xy() == pytest.approx((expected_mid_x, expected_mid_y))
 
     # Start of press
     c.playback_pos = press_start

@@ -28,14 +28,14 @@ from datetime import datetime
 import numpy as np
 import serial
 import serial.tools.list_ports
-os.environ.setdefault('PYQTGRAPH_QT_LIB', 'PyQt5')
+os.environ.setdefault('PYQTGRAPH_QT_LIB', 'PyQt6')
 import pyqtgraph as pg
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QLabel, QListWidget,
     QComboBox, QDoubleSpinBox, QGridLayout, QFrame, QTabWidget)
-from PyQt5.QtCore import QTimer, Qt, QRectF, QPointF
-from PyQt5.QtGui import QFont, QPainter, QColor, QPen, QBrush, QLinearGradient, QPalette, QPainterPath, QRadialGradient
+from PyQt6.QtCore import QTimer, Qt, QRectF, QPointF
+from PyQt6.QtGui import QFont, QPainter, QColor, QPen, QBrush, QLinearGradient, QPalette, QPainterPath, QRadialGradient
 
 # ================= MANTISX-STYLE MODERN COLORS =================
 COLORS = {
@@ -914,7 +914,7 @@ class AimCanvas(QWidget):
 
         # Main dot
         painter.setBrush(QBrush(QColor(COLORS['accent_good'])))
-        painter.setPen(Qt.NoPen)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(int(dot_x) - 6, int(dot_y) - 6, 12, 12)
 
 
@@ -1249,7 +1249,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(status_label)
 
         self.lbl_status = QLabel("DISCONNECTED")
-        self.lbl_status.setAlignment(Qt.AlignCenter)
+        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_status.setStyleSheet(f"""
             QLabel {{
                 background: {COLORS['bg_tertiary']};
@@ -1264,14 +1264,14 @@ class MainWindow(QMainWindow):
 
         # Calibration button
         self.btn_calib = QPushButton("CALIBRATE")
-        self.btn_calib.setCursor(Qt.PointingHandCursor)
+        self.btn_calib.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_calib.clicked.connect(self.start_calibration)
         left_layout.addWidget(self.btn_calib)
         self._stylized_button(self.btn_calib, COLORS['accent_blue'], '#FFF')
 
         # Tare button
         self.btn_tare = QPushButton("TARE — Re-Zero Aim")
-        self.btn_tare.setCursor(Qt.PointingHandCursor)
+        self.btn_tare.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_tare.setToolTip("Stores current orientation as screen center. Use after repositioning.")
         self.btn_tare.clicked.connect(self.do_tare)
         left_layout.addWidget(self.btn_tare)
@@ -1315,7 +1315,7 @@ class MainWindow(QMainWindow):
 
         # Big score display
         self.lbl_big_score = QLabel("--")
-        self.lbl_big_score.setAlignment(Qt.AlignCenter)
+        self.lbl_big_score.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_big_score.setStyleSheet(f"""
             QLabel {{
                 font-size: 96px;
@@ -1327,7 +1327,7 @@ class MainWindow(QMainWindow):
 
         # Shot count
         self.lbl_shot_count = QLabel("Shots: 0")
-        self.lbl_shot_count.setAlignment(Qt.AlignCenter)
+        self.lbl_shot_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_shot_count.setStyleSheet(f"font-size: 16px; color: {COLORS['text_secondary']};")
         center_layout.addWidget(self.lbl_shot_count)
 
@@ -1453,7 +1453,7 @@ class MainWindow(QMainWindow):
 
         # New session button
         self.btn_reset = QPushButton("New Session")
-        self.btn_reset.setCursor(Qt.PointingHandCursor)
+        self.btn_reset.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_reset.clicked.connect(self.reset_session)
         right_layout.addWidget(self.btn_reset)
         self._stylized_button(self.btn_reset, '#B71C1C', '#FFF')
@@ -1502,7 +1502,7 @@ class MainWindow(QMainWindow):
         header_layout.addStretch()
 
         self.btn_export = QPushButton("Export Report")
-        self.btn_export.setCursor(Qt.PointingHandCursor)
+        self.btn_export.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_export.clicked.connect(self._export_report)
         header_layout.addWidget(self.btn_export)
         self._stylized_button(self.btn_export, COLORS['accent_blue'], '#FFF')
@@ -1850,7 +1850,7 @@ class MainWindow(QMainWindow):
             """)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
+        if event.key() == Qt.Key.Key_Escape:
             self.close()
         super().keyPressEvent(event)
 
@@ -1994,11 +1994,11 @@ if __name__ == '__main__':
         logger.info("Hardware Verified.")
         win = MainWindow(ser)
         win.show()
-        sys.exit(app.exec_())
+        sys.exit(app.exec())
 
     logger.info(">> SWITCHING TO SIMULATION MODE <<")
     ser = MockSerial()
     win = MainWindow(ser)
     win.setWindowTitle(win.windowTitle() + " [SIMULATION MODE]")
     win.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())

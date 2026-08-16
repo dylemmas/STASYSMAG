@@ -12,6 +12,21 @@
 #define I2C_SDA 21              
 #define I2C_SCL 22              
 #define MPU_ADDR 0x68
+#define HMC_ADDR 0x2C        // QMC5883P magnetometer (clone of HMC5883L)
+
+#define QMC_REG_CHIP_ID  0x00
+#define QMC_REG_X_LSB    0x01
+#define QMC_REG_X_MSB    0x02
+#define QMC_REG_Y_LSB    0x03
+#define QMC_REG_Y_MSB    0x04
+#define QMC_REG_Z_LSB    0x05
+#define QMC_REG_Z_MSB    0x06
+#define QMC_REG_STATUS   0x09
+#define QMC_REG_CTRL1    0x0A
+#define QMC_REG_CTRL2    0x0B
+#define QMC_CHIP_ID      0x80
+// QMC5883P full-scale ±30 Gauss, 16-bit output → ~655 LSB/Gauss
+#define MAG_GAIN_LSB_PER_GA 655.0
 
 #define VOLTAGE_DIVIDER_RATIO 2.0 
 #define BATTERY_MAX_VOLTAGE 4.2 
@@ -32,6 +47,7 @@ BluetoothSerial SerialBT;
 
 volatile bool isAuthenticated = false;
 volatile int batteryPercentage = 0;
+volatile bool hmc_present = false;
 
 // --- BINARY PACKET STRUCTURE ---
 // Added 'piezo' field to transmit shockwave data
@@ -43,6 +59,9 @@ struct __attribute__((packed)) DataPacket {
   float gx;
   float gy;
   float gz;
+  int16_t mag_x;     // QMC5883P X axis (raw LSB - Python divides by 655 to get mG)
+  int16_t mag_y;     // QMC5883P Y axis
+  int16_t mag_z;     // QMC5883P Z axis
   uint16_t piezo;    // Raw ADC value of the piezo shock
   uint8_t battery;
   uint8_t checksum;
@@ -55,6 +74,55 @@ void writeMPURegister(uint8_t reg, uint8_t val) {
   Wire.write(reg);
   Wire.write(val);
   Wire.endTransmission();
+}
+
+void writeHMCRegister(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(HMC_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+bool initHMC() {
+  // Verify QMC5883P by reading CHIP_ID register (0x00)
+  Wire.beginTransmission(HMC_ADDR);
+  Wire.write(QMC_REG_CHIP_ID);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(HMC_ADDR, (uint8_t)1, true);
+  if (Wire.available() < 1) return false;
+  uint8_t chipId = Wire.read();
+  if (chipId != QMC_CHIP_ID) return false;
+
+  // CTRL2: clear any pending reset / soft reset bit (default 0)
+  Wire.beginTransmission(HMC_ADDR);
+  Wire.write(QMC_REG_CTRL2);
+  Wire.write(0x00);
+  Wire.endTransmission();
+
+  // CTRL1: bits[1:0]=mode (0x03=continuous), bits[3:2]=ODR (0x03=200Hz), bits[5:4]=OSR (0x00=8 samples)
+  Wire.beginTransmission(HMC_ADDR);
+  Wire.write(QMC_REG_CTRL1);
+  Wire.write(0x0C);  // OSR=8 | ODR=200Hz | mode=continuous
+  Wire.endTransmission();
+
+  Serial.println("QMC5883P magnetometer detected (continuous, 200Hz)");
+  return true;
+}
+
+bool readHMC(int16_t &mx, int16_t &my, int16_t &mz) {
+  // Burst-read 6 bytes: X_LSB, X_MSB, Y_LSB, Y_MSB, Z_LSB, Z_MSB
+  Wire.beginTransmission(HMC_ADDR);
+  Wire.write(QMC_REG_X_LSB);
+  Wire.endTransmission(false);
+  Wire.requestFrom(HMC_ADDR, (uint8_t)6, true);
+  if (Wire.available() < 6) return false;
+  uint8_t xl = Wire.read(), xh = Wire.read();
+  uint8_t yl = Wire.read(), yh = Wire.read();
+  uint8_t zl = Wire.read(), zh = Wire.read();
+  mx = (int16_t)(xh << 8 | xl);
+  my = (int16_t)(yh << 8 | yl);
+  mz = (int16_t)(zh << 8 | zl);
+  return true;
 }
 
 float readBatteryVoltage() {
@@ -196,23 +264,33 @@ void sensorTask(void *parameter) {
             delayMicroseconds(400); 
         }
 
+        // Read magnetometer once per packet (100Hz) — do NOT read inside the 1kHz loop
+        int16_t mx_raw = 0, my_raw = 0, mz_raw = 0;
+        if (hmc_present) {
+          readHMC(mx_raw, my_raw, mz_raw);
+        }
+
         // --- PREPARE PACKET ---
         // Use the PEAK Accel found (for Trigger Detect)
         // Use the PEAK Piezo found (for Shock Detect)
         // Use the AVERAGE Gyro (for clean Trace)
-        
+        // Use the single mag sample (for heading reference)
+
         DataPacket pkt;
         pkt.header[0] = 0xAA;
         pkt.header[1] = 0xBB;
         pkt.ax = peak_ax;
         pkt.ay = peak_ay;
         pkt.az = peak_az;
-        
+
         // Convert Gyro Avg (500dps = 65.5 LSB)
         pkt.gx = ((gyro_sum_x / OVERSAMPLE_LOOPS) / 65.5) * 0.0174533;
         pkt.gy = ((gyro_sum_y / OVERSAMPLE_LOOPS) / 65.5) * 0.0174533;
         pkt.gz = ((gyro_sum_z / OVERSAMPLE_LOOPS) / 65.5) * 0.0174533;
-        
+
+        pkt.mag_x = mx_raw;
+        pkt.mag_y = my_raw;
+        pkt.mag_z = mz_raw;
         pkt.piezo = max_piezo; // Send the highest piezo value seen in this 10ms
         pkt.battery = (uint8_t)batteryPercentage;
         
@@ -288,8 +366,11 @@ void setup() {
   // We want NO smoothing on the hardware side, we do it in software
   writeMPURegister(0x1A, 0x00);
 
+  hmc_present = initHMC();
+  Serial.printf("QMC5883P: %s\n", hmc_present ? "detected" : "NOT FOUND (mag disabled)");
+
   Serial.println("Sensor Configured: 4G / 500dps / 260Hz / 1kHz Polling / Piezo Active");
-  
+
   xTaskCreatePinnedToCore(sensorTask, "SensorTask", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(batteryMonitorTask, "BatMonitor", 2048, NULL, 1, NULL, 0);
 }
