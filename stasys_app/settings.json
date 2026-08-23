@@ -1,3 +1,8 @@
 {
-    "connection_mode": "connection"
+    "connection_mode": "simulation",
+    "target_distance": 10.0,
+    "muzzle_velocity": 200.0,
+    "trigger_pull_time_ms": 50.0,
+    "firearm_profile": "FWB_P800",
+    "target_type": "10m_air_pistol"
 }

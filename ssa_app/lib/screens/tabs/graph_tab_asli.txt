@@ -1,0 +1,393 @@
+// ============================================
+// File: screens/tabs/graph_tab.dart (UPDATED)
+// ============================================
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../../providers/sensor_data_provider.dart';
+import '../../providers/bluetooth_provider.dart';
+import '../../providers/session_provider.dart';
+import '../../widgets/gyro_realtime_chart.dart';
+
+class GraphTab extends StatelessWidget {
+  const GraphTab({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.grey[50],
+      appBar: AppBar(
+        title: const Text('Real-Time Analysis'),
+        backgroundColor: Colors.green,
+        foregroundColor: Colors.white,
+        elevation: 2,
+      ),
+      body: Column(
+        children: [
+          // Status Bar
+          _buildStatusBar(),
+
+          // Main Chart
+          const Expanded(
+            flex: 3,
+            child: GyroRealtimeChart(),
+          ),
+
+          // Control Panel
+          _buildControlPanel(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatusBar() {
+    return Consumer2<SensorDataProvider, BluetoothProvider>(
+      builder: (context, sensorProvider, bluetoothProvider, child) {
+        return Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            boxShadow: [
+              BoxShadow(
+                color: Colors.grey.withValues(alpha: 0.2),
+                spreadRadius: 1,
+                blurRadius: 3,
+                offset: const Offset(0, 2),
+              ),
+            ],
+          ),
+          child: Column(
+            children: [
+              // Connection & Battery Row
+              Row(
+                children: [
+                  // Connection Status
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: bluetoothProvider.isConnected ? Colors.green : Colors.red,
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          bluetoothProvider.isConnected
+                              ? Icons.bluetooth_connected
+                              : Icons.bluetooth_disabled,
+                          color: Colors.white,
+                          size: 16,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          bluetoothProvider.isConnected ? 'Connected' : 'Disconnected',
+                          style: const TextStyle(color: Colors.white, fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(width: 16),
+
+                  // Battery Level
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: _getBatteryColor(sensorProvider.batteryLevel),
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          _getBatteryIcon(sensorProvider.batteryLevel),
+                          color: Colors.white,
+                          size: 16,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          '${sensorProvider.batteryLevel}%',
+                          style: const TextStyle(color: Colors.white, fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const Spacer(),
+
+                  // Recording Duration
+                  if (sensorProvider.isRecording)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.blue,
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.timer, color: Colors.white, size: 16),
+                          const SizedBox(width: 4),
+                          Text(
+                            _formatDuration(sensorProvider.recordingDuration),
+                            style: const TextStyle(color: Colors.white, fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildControlPanel() {
+    return Consumer2<SensorDataProvider, BluetoothProvider>(
+      builder: (context, sensorProvider, bluetoothProvider, child) {
+        return Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            boxShadow: [
+              BoxShadow(
+                color: Colors.grey.withValues(alpha: 0.2),
+                spreadRadius: 1,
+                blurRadius: 3,
+                offset: const Offset(0, -2),
+              ),
+            ],
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Main Control Buttons
+              Row(
+                children: [
+                  // Calibration Button
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: (bluetoothProvider.isConnected &&
+                                 !sensorProvider.isRecording &&
+                                 !sensorProvider.isCalibrating)
+                          ? () => _showCalibrationDialog(context)
+                          : null,
+                      icon: Icon(
+                        sensorProvider.isCalibrated ? Icons.check_circle : Icons.settings,
+                      ),
+                      label: Text(sensorProvider.isCalibrating
+                          ? 'Calibrating...'
+                          : 'Calibrate'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: sensorProvider.isCalibrated
+                            ? Colors.green
+                            : Colors.orange,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(width: 12),
+
+                  // Record Button
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: (!bluetoothProvider.isConnected ||
+                                 !sensorProvider.isCalibrated)
+                          ? null
+                          : () {
+                            if (!sensorProvider.isRecording){
+                              // First press - Start
+                              sensorProvider.startRecording();
+                            } else if (!sensorProvider.canSaveSession) {
+                              // Secnod press - Stop
+                              sensorProvider.stopRecording();
+                            } else {
+                              // Third press - Restart
+                              sensorProvider.startRecording();
+                            }
+                          },
+                      icon: Icon(
+                        sensorProvider.isRecording ? Icons.stop : Icons.play_arrow,
+                      ),
+                      label: Text(
+                        !sensorProvider.isRecording ? 'Start' :
+                        sensorProvider.canSaveSession ? 'Start' : 'Stop'
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: sensorProvider.isRecording
+                            ? Colors.red
+                            : Colors.blue,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(width: 12),
+
+                  // Save Button
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: sensorProvider.canSaveSession
+                          ? () => _saveSession(context)
+                          : null,
+                      icon: const Icon(Icons.save),
+                      label: const Text('Save'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.blue,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                    ),
+                  ),
+                //   if (SessionProvider.canSaveSession) {
+                ],
+              ),
+
+              const SizedBox(height: 12),
+
+              // Status Text
+              Text(
+                _getStatusText(bluetoothProvider, sensorProvider),
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 14,
+                  color: Colors.grey[600],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // Helper methods
+  Color _getBatteryColor(int batteryLevel) {
+    if (batteryLevel > 50) return Colors.green;
+    if (batteryLevel > 20) return Colors.orange;
+    return Colors.red;
+  }
+
+  IconData _getBatteryIcon(int batteryLevel) {
+    if (batteryLevel > 90) return Icons.battery_full;
+    if (batteryLevel > 60) return Icons.battery_5_bar;
+    if (batteryLevel > 30) return Icons.battery_3_bar;
+    if (batteryLevel > 10) return Icons.battery_1_bar;
+    return Icons.battery_alert;
+  }
+
+  String _formatDuration(Duration duration) {
+    String twoDigits(int n) => n.toString().padLeft(2, '0');
+    return "${twoDigits(duration.inMinutes)}:${twoDigits(duration.inSeconds % 60)}";
+  }
+
+  String _getStatusText(BluetoothProvider bluetoothProvider, SensorDataProvider sensorProvider) {
+    if (!bluetoothProvider.isConnected) {
+      return 'Connect to device first';
+    } else if (!sensorProvider.isCalibrated) {
+      return 'Calibrate sensor before recording';
+    } else if (sensorProvider.isRecording) {
+      return 'Recording in progress...';
+    } else if (sensorProvider.canSaveSession) {
+      return 'Session ready to save';
+    } else {
+      return 'Ready to start recording';
+    }
+  }
+
+  void _showCalibrationDialog(BuildContext context) {
+    final sensorProvider = context.read<SensorDataProvider>();
+    sensorProvider.startCalibration();
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext dialogContext) {
+        return Consumer<SensorDataProvider>(
+          builder: (context, provider, _) {
+            if (!provider.isCalibrating && Navigator.canPop(dialogContext)) {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                Navigator.of(dialogContext).pop();
+                if (provider.isCalibrated) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Calibration completed successfully!'),
+                      backgroundColor: Colors.green,
+                    ),
+                  );
+                }
+              });
+            }
+
+            return AlertDialog(
+              title: const Text('Sensor Calibration'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(
+                    Icons.settings,
+                    size: 64,
+                    color: Colors.orange,
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Place the sensor on a flat surface and keep it steady.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 16),
+                  ),
+                  const SizedBox(height: 20),
+                  const CircularProgressIndicator(),
+                  const SizedBox(height: 16),
+                  Text(
+                    'Progress: ${provider.calibrationSamplesCount}/${provider.samplesToCollect}',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  LinearProgressIndicator(
+                    value: provider.calibrationSamplesCount / provider.samplesToCollect,
+                    backgroundColor: Colors.grey[300],
+                    valueColor: const AlwaysStoppedAnimation<Color>(Colors.orange),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _saveSession(BuildContext context) async {
+    try {
+      final sensorProvider = context.read<SensorDataProvider>();
+      final sessionProvider = context.read<SessionProvider>();
+
+      await sensorProvider.saveCurrentSession();
+      await sessionProvider.loadSessions();
+
+      if (!context.mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Session saved successfully!'),
+          backgroundColor: Colors.green,
+          duration: Duration(seconds: 2),
+        ),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to save session: $e'),
+          backgroundColor: Colors.red,
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
+  }
+}
