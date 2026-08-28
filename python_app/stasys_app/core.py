@@ -2162,7 +2162,7 @@ class ShotTraceCanvas(QWidget):
 
         if not svg_path.exists():
             # Try current directory fallback
-            svg_path = Path('stasys_app') / 'image_assets' / spec.svg_filename
+            svg_path = Path(__file__).parent / 'image_assets' / spec.svg_filename
 
         if not svg_path.exists():
             # SVG not found — fall back to simple rings

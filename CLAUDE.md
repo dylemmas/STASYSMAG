@@ -1,103 +1,152 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working in this repository.
 
 ## Project Overview
 
-STASYS is a battery-powered shooting training sensor system inspired by commercial products like MantisX and SCATT. It streams 9-axis IMU (MPU6050 + QMC5883P magnetometer) + piezo knock sensor data over Bluetooth Classic to a Python receiver application at 100Hz, enabling professional-grade aim analysis and shot coaching.
+STASYS is a battery-powered shooting-training sensor system. An ESP32 DEVKITV1 reads a 6-axis MPU6050 IMU, a QMC5883P magnetometer, a piezo vibration sensor, and battery voltage, then streams sensor packets over Bluetooth Classic SPP. The receiver performs orientation estimation, shot detection, ISSF scoring, live visualization, and session analysis.
 
-**Hardware:** ESP32 DEVKITV1 + MPU6050 IMU + QMC5883P magnetometer + piezo knock sensor + Li-Ion battery with TP4056 charger
+**Hardware:** ESP32 DEVKITV1, MPU6050, QMC5883P, piezo knock sensor, Li-Ion battery with TP4056 charger
 
-**Use cases:** Dry fire and live fire training for pistol, rifle, archery, and shotgun (attached on the bottom of the gun)
+**Use cases:** Dry-fire and live-fire training for pistol, rifle, archery, and shotgun
+
+## Repository Layout
+
+- `firmware/src/main.cpp` — native ESP-IDF firmware entry point and FreeRTOS tasks
+- `firmware/components/sensors/` — MPU6050, QMC5883P, piezo, and battery HAL
+- `firmware/components/app_protocol/` — packet serialization and authentication digest
+- `firmware/components/system_config/` — shared GPIO, sensor, and packet constants
+- `firmware/legacy/` — historical Arduino sketches and legacy firmware image
+- `python_app/stasys_app/` — modular PyQt5 receiver application
+- `python_app/stasys_app/SL.py` — executable entry point and compatibility façade
+- `python_app/stasys_app/core.py` — current implementation façade containing the larger legacy-compatible application surface
+- `python_app/test/` — Python protocol, filter, detector, scoring, replay, and module-boundary tests
+- `android_app/` — Flutter Android companion application
+- `docs/superpowers/specs/` and `docs/superpowers/plans/` — design and implementation records
+- `firmware/platformio.ini`, `firmware/CMakeLists.txt` — PlatformIO/ESP-IDF build configuration
+
+The supported receiver in this checkout is the Python application. The Flutter Android app is maintained separately under `android_app/`.
 
 ## Build Commands
 
 ### ESP32 Firmware
+
 ```bash
-pio run              # Build firmware
-pio run --target upload   # Build and flash to ESP32
-pio run --target monitor  # Build and open serial monitor (115200 baud)
-pio run -e esp32dev  # Build specific environment
+cd firmware
+pio run                              # Build the esp32dev environment
+pio run --target upload              # Build and flash the board
+pio run --target monitor             # Open the 115200-baud serial monitor
+pio run -e esp32dev                  # Explicit environment selection
 ```
+
+The firmware uses `espressif32@6.12.0`, the ESP-IDF framework, a 240 MHz CPU, and release build settings. Native ESP-IDF builds can also use `firmware/CMakeLists.txt` when `IDF_PATH` is configured.
 
 ### Python Receiver
+
 ```bash
-python stasys_app/SL.py  # Run the PyQt5 receiver application
+python python_app/stasys_app/SL.py
 ```
 
-### Tests
+The receiver opens a connection dialog, supports simulation mode, and then launches the main window. It persists session data in `python_app/stasys_app/shooter_data.db` and settings in `python_app/stasys_app/settings.json`.
+
+### Python Tests
+
 ```bash
-python -m pytest test/ -v                    # Run all tests
-python -m pytest test/test_issf_target.py -v  # Run a single test file
-python -m pytest test/ --ignore=test/test_aim_trail.py  # Skip broken Qt tests
+python -m pytest python_app/test/ -v
+python -m pytest python_app/test/test_issf_target.py -v
+python -m pytest python_app/test/ --ignore=python_app/test/test_aim_trail.py
 ```
 
-**Known test issue:** Tests import from `base` or `stasys_app.base`, but the main application module is `stasys_app/SL.py`. Tests need their import statements updated to use `from SL import ...` or `from stasys_app.SL import ...` respectively. The application itself uses PyQt5 (not PyQt6 as some tests assume).
+### Android App
+
+```bash
+cd android_app
+flutter pub get
+flutter test
+```
+
+Tests are written for pytest. In environments without pytest installed, test collection cannot run; install the project test dependencies before treating that as a code failure. Some historical tests may still contain legacy import assumptions, so verify imports against the current `python_app/stasys_app` module layout.
 
 ## Hardware Architecture
 
 | Pin | Role |
 |-----|------|
-| GPIO 39 (ADC1_CH3) | Battery voltage via 100k/100k divider |
+| GPIO 39 (ADC1_CH3) | Battery voltage through a 100k/100k divider |
 | GPIO 35 (ADC1_CH7) | Piezo knock/vibration sensor |
-| GPIO 21 / 22 | I2C SDA / SCL for MPU6050 |
-| GPIO 21 / 22 | I2C SDA / SCL for QMC5883P (shared bus) |
+| GPIO 21 / 22 | Shared I2C SDA / SCL for MPU6050 and QMC5883P |
 
-**MPU6050 configuration:** 4G accel range, 500dps gyro, DLPF bandwidth 260Hz (register 0x1A = 0x00).
+Firmware sensor constants are defined in `firmware/components/system_config/system_config.h`:
 
-**QMC5883P configuration:** +/-30 Gauss full-scale, ~655 LSB/Gauss sensitivity, continuous measurement mode at 200Hz. Mag readings are raw LSB units - convert to mG by dividing by 0.655.
+- MPU6050 address `0x68`; QMC5883P address `0x2C`
+- 10 sensor oversampling iterations per packet
+- 100 Hz packet period (`10,000` microseconds)
+- MPU6050 scale: ±4 g accelerometer and ±500 dps gyroscope
+- Battery range: 3.0–4.2 V with a 2:1 divider
 
-**Packet format** (`<ffffffhhhHB`): 6 floats (acc/gyro) + 3 shorts (mag) + 1 ushort (piezo) + 1 byte (bat) = 33 bytes payload. Total 36 bytes with 2-byte header + 1-byte checksum.
+The QMC5883P is optional at runtime. Firmware records `qmc_present` during initialization and sends zero/raw-last magnetometer values when the device is unavailable.
 
 ## Firmware Architecture
 
-Single-file Arduino sketch (`src/main.cpp`). Two FreeRTOS tasks, no external dependencies beyond ESP32 core libraries:
+The firmware is native ESP-IDF C/C++ rather than the previous monolithic Arduino sketch. `app_main()` initializes NVS, the sensor HAL, Bluetooth Classic SPP, and two pinned FreeRTOS tasks:
 
-- **sensorTask** (Core 1, priority 1) — Reads MPU6050 raw registers via I2C, QMC5883P magnetometer (once per packet at 100Hz), and piezo ADC 10x per packet (1kHz oversampling). Extracts peak acceleration (for click detection via jerk) and peak piezo value, averages gyro. Sends binary `DataPacket` over Bluetooth at 100Hz. Challenge-response auth via SHA-256 HMAC on first connection.
-- **batteryMonitorTask** (Core 0, priority 1) — Polls battery voltage every 2s, publishes percentage to shared `batteryPercentage` variable when delta >= 2%.
+- **`sensor_task` (Core 1):** waits for authentication, samples MPU6050 and piezo data, tracks peak acceleration/jerk and averaged gyro values, reads the magnetometer, serializes a packet, and sends it at 100 Hz while the SPP link is not congested.
+- **`battery_task` (Core 0):** averages 16 ADC readings every 2 seconds and publishes the calculated battery percentage.
 
-## Software Architecture — Python Receiver
+Bluetooth advertises a device name in the `STASYS-XXXX` form and exposes an SPP service named `STASYS`. Connection and authentication state are guarded with FreeRTOS event bits; sensor packet writes are protected by the SPP spinlock.
 
-Single-file PyQt5 GUI application (`stasys_app/SL.py`, ~4300 lines) with 4-tab interface:
+## Communication Protocol
 
-1. **Live Monitor** — Real-time aim canvas with phosphor trail, sensor status, calibration controls
-2. **Shot Analysis** — Phase-colored shot trace visualization, per-shot stats, session summary
-3. **Session History** — Browser for past sessions with playback
-4. **Settings** — Firearm profile, training mode, COM port, detection thresholds
-
-Data persisted in SQLite (`stasys_app/shooter_data.db`). Settings stored in `stasys_app/settings.json`.
-
-### Core Components
-
-**ShotDetector class** (line 1178) — Heart of the application. Handles all sensor processing:
-- State machine: IDLE -> ARMING -> ARMED -> POST_GATHER -> COOLDOWN -> IDLE
-- Mahony 9-DOF AHRS filter: Fuses gyro + accelerometer + magnetometer into quaternion orientation at 100Hz
-- Magnetometer handling: hard-iron bias subtraction during calibration, auto-disable when norm deviates >40% from calibrated reference
-- 40-second circular buffer (4000 samples at 100Hz); trigger at index 2000 (center) for complete pre/post-shot analysis
-- Dual-mode shot detection: Mode 0 (Dry Fire) uses piezo threshold; Mode 1 (Live Fire) uses jerk-based detection
-
-**Mahony filter** (`_mahony_step` at line 413): Uses fixed world-frame magnetic reference to avoid circular-reference bugs.
-
-**ISSF Target scoring** (`ISSFTargetSpec` at line 213, `calculate_issf_score` at line 254): Decimal scoring for ISSF target types (10m_air_pistol, 20m_pistol, 50m_free_pistol).
-
-### Key Constants
-- `DT = 0.01` (10ms, 100Hz)
-- `HOLD_DURATION_IDX = 300` (3.0s pre-shot stability window)
-- `PRESS_DURATION_IDX = 20` (0.2s trigger-pull window)
-- `RECOIL_DURATION_IDX = 100` (1.0s follow-through window)
-- `SHOT_PHASE_TOTAL = 420` (total phase samples)
-
-## Communication Protocol Summary
+The packet constants and serialization contract live in `firmware/components/app_protocol/include/app_protocol.h` and `firmware/components/app_protocol/app_protocol.cpp`.
 
 | Property | Value |
 |----------|-------|
 | Transport | Bluetooth Classic SPP |
-| Baud Rate | 115200 |
-| Packet Rate | 100Hz |
-| Packet Size | 36 bytes |
-| Auth | SHA-256 HMAC challenge-response |
+| Packet rate | 100 Hz |
+| Serialized packet size | 36 bytes |
+| Header | `0xAA 0xBB` |
+| Payload | 6 little-endian float32 values, 3 little-endian int16 magnetometer values, uint16 piezo, uint8 battery |
+| Checksum | XOR of serialized bytes 2 through 34 |
+| Authentication | SHA-256 of challenge bytes followed by the device secret; lowercase 64-character hex response |
 
-## Known Issues
+The payload is 33 bytes; the remaining 3 bytes are the 2-byte header and 1-byte checksum. Keep the firmware serializer and Python parser tests synchronized when changing this contract.
 
-- **Test import paths broken:** Tests reference `base` or `stasys_app.base` but the actual module is `stasys_app.SL`. Tests also use PyQt6 while the application uses PyQt5.
-- **Authentication timeout:** `AUTH_TIMEOUT` is 12s to match the firmware's 10s window. First connection must complete within this window.
+## Python Receiver Architecture
+
+The receiver is PyQt5-based and currently exposes four main workflows:
+
+1. **Live Monitor** — real-time aim canvas, phosphor trail, sensor status, and calibration controls
+2. **Shot Analysis** — phase-colored trajectory, per-shot metrics, and session summary
+3. **Session History** — persisted session browsing and replay
+4. **Settings** — firearm profile, training mode, serial device, and detection thresholds
+
+### Core Components
+
+- **`ShotDetector`** — state machine `IDLE -> ARMING -> ARMED -> POST_GATHER -> COOLDOWN -> IDLE`; combines piezo/jerk detection with the AHRS pipeline and maintains the circular sample buffer.
+- **Mahony filter** — fuses gyro, accelerometer, and optional magnetometer data at 100 Hz. Magnetometer calibration subtracts hard-iron bias and disables magnetic correction when the field norm deviates by more than 40% from the calibrated reference.
+- **ISSF scoring** — `ISSFTargetSpec` and `calculate_issf_score` support the configured pistol and rifle target profiles, including `10m_air_pistol`, `10m_air_rifle`, `20m_pistol`, and `50m_free_pistol`.
+- **Database/settings helpers** — SQLite session storage and JSON settings persistence.
+- **Canvas/widgets/pages** — PyQt5 visualization and page composition extracted from the original receiver UI.
+
+Important processing constants remain in the Python application and tests:
+
+- `DT = 0.01` (100 Hz)
+- `HOLD_DURATION_IDX = 300` (3.0 seconds)
+- `PRESS_DURATION_IDX = 20` (0.2 seconds)
+- `RECOIL_DURATION_IDX = 100` (1.0 second)
+- `SHOT_PHASE_TOTAL = 420` samples
+
+## Development Guidelines
+
+- Keep the firmware packet format compatible with the Python receiver and native protocol tests.
+- Put hardware access in `firmware/components/sensors`; keep protocol encoding in `firmware/components/app_protocol`.
+- Preserve `python_app/stasys_app/SL.py` as the supported command-line entry point and compatibility façade.
+- Follow the repository Python rules: PEP 8, type annotations for new function signatures, black, isort, and ruff where available.
+- Add or update pytest coverage for changes to scoring, filtering, packet parsing, detection, persistence, or module boundaries.
+- Do not commit generated build output, Python bytecode, local databases, or device credentials.
+
+## Known Issues and Constraints
+
+- Pytest may not be installed in the development environment; a missing test runner is an environment issue, not a failing assertion.
+- Some legacy tests/import paths may need migration to `stasys_app.SL` or the extracted modules.
+- The receiver currently has a 12-second authentication timeout; keep it aligned with the handshake behavior when changing authentication or connection setup.
+- The protocol currently uses a shared firmware secret and a plain SHA-256 construction; treat changes to authentication as security-sensitive and update both sides together.

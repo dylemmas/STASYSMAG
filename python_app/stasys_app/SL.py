@@ -6,7 +6,7 @@ import sys
 try:
     from .core import *  # noqa: F401,F403 - preserve the historical SL API
     from .core import MainWindow, ConnectionScreen, setup_database
-except ImportError:  # Support `python stasys_app/SL.py` from the repo root.
+except ImportError:  # Support `python python_app/stasys_app/SL.py` from the repo root.
     from core import *  # type: ignore # noqa: F401,F403
     from core import MainWindow, ConnectionScreen, setup_database  # type: ignore
 

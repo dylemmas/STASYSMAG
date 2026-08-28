@@ -1,4 +1,4 @@
-# ssa_app
+# STASYS Android App
 
 A new Flutter project.
 

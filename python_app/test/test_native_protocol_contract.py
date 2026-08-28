@@ -3,9 +3,9 @@
 from pathlib import Path
 
 
-ROOT = Path(__file__).parents[1]
-HEADER = ROOT / "components" / "app_protocol" / "include" / "app_protocol.h"
-SOURCE = ROOT / "components" / "app_protocol" / "app_protocol.cpp"
+ROOT = Path(__file__).parents[2]
+HEADER = ROOT / "firmware" / "components" / "app_protocol" / "include" / "app_protocol.h"
+SOURCE = ROOT / "firmware" / "components" / "app_protocol" / "app_protocol.cpp"
 
 
 def test_native_protocol_component_declares_36_byte_packet():

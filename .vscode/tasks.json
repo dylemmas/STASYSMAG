@@ -5,11 +5,11 @@
             "label": "Run STASYS App",
             "type": "shell",
             "command": "python",
-            "args": ["stasys_app/main.py"],
+            "args": ["SL.py"],
             "options": {
-                "cwd": "${workspaceFolder}",
+                "cwd": "${workspaceFolder}/python_app/stasys_app",
                 "env": {
-                    "PYTHONPATH": "${workspaceFolder}"
+                    "PYTHONPATH": "${workspaceFolder}/python_app"
                 }
             },
             "problemMatcher": []
@@ -20,9 +20,9 @@
             "command": "python",
             "args": ["-m", "pytest", "test/", "-v"],
             "options": {
-                "cwd": "${workspaceFolder}",
+                "cwd": "${workspaceFolder}/python_app",
                 "env": {
-                    "PYTHONPATH": "${workspaceFolder}"
+                    "PYTHONPATH": "${workspaceFolder}/python_app"
                 }
             },
             "problemMatcher": []

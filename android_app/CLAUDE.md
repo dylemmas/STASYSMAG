@@ -13,7 +13,7 @@ Mobile companion app for the STASYS shooter stability analyzer. Primary platform
 ## Architecture
 
 ```
-ssa_app/
+android_app/
 ├── lib/
 │   ├── main.dart                    # App entry, MultiProvider + GoRouter
 │   ├── router/app_router.dart       # GoRouter configuration (ShellRoute)
@@ -486,9 +486,9 @@ OtaState.idle → loading → sending → verifying → rebooting → completed
 
 1. Update `Firmware_STASYS32/src/storage/storage.h` → `#define FIRMWARE_VERSION "X.Y.Z"`
 2. Build firmware: `cd Firmware_STASYS32 && python -m platformio run -e esp32dev`
-3. Copy binary: `cp .pio/build/esp32dev/firmware.bin ../ssa_app/assets/firmware/stasys_fw.bin`
+3. Copy binary: `cp .pio/build/esp32dev/firmware.bin ../android_app/assets/firmware/stasys_fw.bin`
 4. Update `firmware_service.dart` → `expectedVersion = 'X.Y.Z'`
-5. Build APK: `cd ssa_app && flutter build apk --debug`
+5. Build APK: `cd android_app && flutter build apk --debug`
 
 ---
 
@@ -643,7 +643,7 @@ Bluetooth debug logs in `bluetooth_provider.dart`:
 
 #### Firebase Crashlytics Setup (Pending)
 - [ ] Create Firebase project in Firebase Console
-- [ ] Download `google-services.json` to `ssa_app/android/app/`
+- [ ] Download `google-services.json` to `android_app/android/app/`
 - [ ] Add Firebase plugins to `android/app/build.gradle`:
   ```groovy
   plugins {
